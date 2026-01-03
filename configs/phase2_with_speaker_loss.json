@@ -1,0 +1,28 @@
+{
+  "experiment_name": "phase2_with_speaker_loss",
+  "description": "Phase 2: Self-reconstruction + speaker consistency loss",
+  "pretrained_model": "hubertsiuzdak/snac_24khz",
+  "speaker_emb_dim": 512,
+  "freeze_base": true,
+  "train_data": "data/train_split",
+  "val_data": "data/val_split",
+  "segment_length": 4.0,
+  "batch_size": 16,
+  "num_workers": 4,
+  "num_epochs": 100,
+  "early_stopping_patience": 4,
+  "learning_rate": 0.0001,
+  "weight_decay": 0.00001,
+  "grad_clip": 1.0,
+  "lr_min_ratio": 0.01,
+  "save_every": 10,
+  "output_dir": "checkpoints/phase2_with_speaker_loss",
+  "l1_weight": 1.0,
+  "stft_weight": 1.0,
+  "speaker_loss_weight": 0.1,
+  "n_ffts": [
+    1024,
+    2048,
+    4096
+  ]
+}
