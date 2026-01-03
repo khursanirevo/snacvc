@@ -112,3 +112,293 @@ class SNAC(nn.Module):
         model.load_state_dict(state_dict)
         model.eval()
         return model
+
+
+class SNACWithSpeakerConditioning(nn.Module):
+    """
+    SNAC with speaker conditioning using FiLM layers.
+
+    This model wraps a pretrained SNAC model and adds speaker conditioning
+    to the decoder using FiLM (Feature-wise Linear Modulation) layers.
+    The base SNAC model is frozen, and only the FiLM parameters are trained.
+
+    Args:
+        sampling_rate: Audio sample rate (default: from pretrained)
+        encoder_dim: Encoder dimension
+        encoder_rates: Encoder downsampling strides
+        latent_dim: Latent dimension
+        decoder_dim: Decoder dimension
+        decoder_rates: Decoder upsampling strides
+        attn_window_size: Attention window size
+        codebook_size: VQ codebook size
+        codebook_dim: VQ codebook dimension
+        vq_strides: VQ strides for hierarchical quantization
+        noise: Whether to use noise in decoder
+        depthwise: Whether to use depthwise convolutions
+        speaker_emb_dim: Dimension of speaker embedding (default: 512)
+        freeze_base: Whether to freeze base SNAC model (default: True)
+    """
+
+    def __init__(
+        self,
+        sampling_rate=44100,
+        encoder_dim=64,
+        encoder_rates=[3, 3, 7, 7],
+        latent_dim=None,
+        decoder_dim=1536,
+        decoder_rates=[7, 7, 3, 3],
+        attn_window_size=32,
+        codebook_size=4096,
+        codebook_dim=8,
+        vq_strides=[8, 4, 2, 1],
+        noise=True,
+        depthwise=True,
+        speaker_emb_dim=512,
+        freeze_base=True,
+    ):
+        super().__init__()
+
+        # Initialize base SNAC model
+        self.base_model = SNAC(
+            sampling_rate=sampling_rate,
+            encoder_dim=encoder_dim,
+            encoder_rates=encoder_rates,
+            latent_dim=latent_dim,
+            decoder_dim=decoder_dim,
+            decoder_rates=decoder_rates,
+            attn_window_size=attn_window_size,
+            codebook_size=codebook_size,
+            codebook_dim=codebook_dim,
+            vq_strides=vq_strides,
+            noise=noise,
+            depthwise=depthwise,
+        )
+
+        # Copy relevant attributes
+        self.sampling_rate = sampling_rate
+        self.latent_dim = self.base_model.latent_dim
+        self.decoder_dim = decoder_dim
+        self.decoder_rates = decoder_rates
+        self.hop_length = self.base_model.hop_length
+        self.attn_window_size = attn_window_size
+        self.vq_strides = vq_strides
+        self.n_codebooks = len(vq_strides)
+        self.codebook_size = codebook_size
+        self.codebook_dim = codebook_dim
+
+        # Freeze base model parameters
+        if freeze_base:
+            for param in self.base_model.parameters():
+                param.requires_grad = False
+            self.base_model.eval()
+
+        # Speaker encoder (use simple version to avoid speechbrain compatibility issues)
+        from .simple_speaker_encoder import SpeakerEncoder
+        self.speaker_encoder = SpeakerEncoder(
+            embedding_dim=speaker_emb_dim,
+            snac_sample_rate=sampling_rate
+        )
+
+        # Build conditioned decoder
+        self._build_conditioned_decoder(speaker_emb_dim)
+
+    def _build_conditioned_decoder(self, cond_dim):
+        """Build decoder with FiLM conditioning."""
+        from .layers import DecoderBlockWithFiLM, WNConv1d
+
+        channels = self.decoder_dim
+        rates = self.decoder_rates
+        d_out = 1
+        input_channel = self.latent_dim
+
+        # Initial layers (same as original Decoder)
+        layers = [
+            WNConv1d(input_channel, input_channel, kernel_size=7, padding=3, groups=input_channel),
+            WNConv1d(input_channel, channels, kernel_size=1),
+        ]
+
+        if self.attn_window_size is not None:
+            from .attention import LocalMHA
+            layers += [LocalMHA(dim=channels, window_size=self.attn_window_size)]
+
+        self.initial_layers = nn.Sequential(*layers)
+
+        # DecoderBlocks with FiLM conditioning
+        self.decoder_blocks = nn.ModuleList()
+        for i, stride in enumerate(rates):
+            input_dim = channels // 2**i
+            output_dim = channels // 2 ** (i + 1)
+            groups = output_dim  # depthwise=True
+
+            self.decoder_blocks.append(
+                DecoderBlockWithFiLM(
+                    input_dim=input_dim,
+                    output_dim=output_dim,
+                    stride=stride,
+                    noise=True,
+                    groups=groups,
+                    cond_dim=cond_dim
+                )
+            )
+
+        # Final layers
+        from .layers import Snake1d
+        self.final_layers = nn.Sequential(
+            Snake1d(channels // 2**len(rates)),
+            WNConv1d(channels // 2**len(rates), d_out, kernel_size=7, padding=3),
+            nn.Tanh(),
+        )
+
+    def extract_speaker_embedding(self, audio: torch.Tensor) -> torch.Tensor:
+        """
+        Extract speaker embedding from audio.
+
+        Args:
+            audio: (B, 1, T) audio waveform
+
+        Returns:
+            (B, speaker_emb_dim) L2-normalized speaker embedding
+        """
+        return self.speaker_encoder(audio)
+
+    def preprocess(self, audio_data: torch.Tensor) -> torch.Tensor:
+        """Preprocess audio using base model's preprocessing."""
+        return self.base_model.preprocess(audio_data)
+
+    def encode(self, audio_data: torch.Tensor) -> List[torch.Tensor]:
+        """
+        Encode audio to hierarchical codes using frozen encoder.
+
+        Args:
+            audio_data: (B, 1, T) audio waveform
+
+        Returns:
+            List of 4 code tensors at different temporal resolutions
+        """
+        audio_data = self.preprocess(audio_data)
+        z = self.base_model.encoder(audio_data)
+        _, codes = self.base_model.quantizer(z)
+        return codes
+
+    def decode(
+        self,
+        codes: List[torch.Tensor],
+        speaker_embedding: torch.Tensor = None,
+        reference_audio: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Decode codes with optional speaker conditioning.
+
+        Args:
+            codes: List of 4 code tensors from encode()
+            speaker_embedding: Optional (B, speaker_emb_dim) speaker embedding
+            reference_audio: Optional (B, 1, T) reference audio for speaker extraction
+
+        Returns:
+            (B, 1, T) reconstructed audio waveform
+        """
+        # Reconstruct latent from codes using frozen VQ decoder
+        z_q = self.base_model.quantizer.from_codes(codes)
+
+        # Extract speaker embedding if reference audio provided
+        if speaker_embedding is None and reference_audio is not None:
+            speaker_embedding = self.extract_speaker_embedding(reference_audio)
+
+        if speaker_embedding is None:
+            # Zero conditioning (no speaker modification)
+            B = z_q.shape[0]
+            cond_dim = self.decoder_blocks[0].res1.film.gamma_fc.out_features
+            speaker_embedding = torch.zeros(B, cond_dim, device=z_q.device, dtype=z_q.dtype)
+
+        # Pass through conditioned decoder
+        x = self.initial_layers(z_q)
+
+        for decoder_block in self.decoder_blocks:
+            x = decoder_block(x, speaker_embedding)
+
+        audio_hat = self.final_layers(x)
+        return audio_hat
+
+    def forward(
+        self,
+        audio_data: torch.Tensor,
+        speaker_embedding: torch.Tensor = None,
+        reference_audio: torch.Tensor = None,
+    ) -> tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Full encode-decode pass with speaker conditioning.
+
+        Args:
+            audio_data: (B, 1, T) input audio waveform
+            speaker_embedding: Optional (B, speaker_emb_dim) speaker embedding
+            reference_audio: Optional (B, 1, T) reference audio for speaker extraction
+
+        Returns:
+            audio_hat: (B, 1, T) reconstructed audio waveform
+            codes: List of 4 code tensors
+        """
+        length = audio_data.shape[-1]
+        audio_data = self.preprocess(audio_data)
+
+        # Encode using frozen encoder
+        z = self.base_model.encoder(audio_data)
+        z_q, codes = self.base_model.quantizer(z)
+
+        # Extract speaker embedding
+        if speaker_embedding is None and reference_audio is not None:
+            speaker_embedding = self.extract_speaker_embedding(reference_audio)
+        if speaker_embedding is None:
+            speaker_embedding = self.extract_speaker_embedding(audio_data)
+
+        # Decode with conditioning
+        x = self.initial_layers(z_q)
+
+        for decoder_block in self.decoder_blocks:
+            x = decoder_block(x, speaker_embedding)
+
+        audio_hat = self.final_layers(x)
+        return audio_hat[..., :length], codes
+
+    @classmethod
+    def from_pretrained_base(
+        cls,
+        repo_id: str,
+        speaker_emb_dim: int = 512,
+        freeze_base: bool = True,
+        **kwargs
+    ):
+        """
+        Load pretrained SNAC and add speaker conditioning.
+
+        Args:
+            repo_id: HuggingFace repo ID (e.g., "hubertsiuzdak/snac_24khz")
+            speaker_emb_dim: Dimension of speaker embedding
+            freeze_base: Whether to freeze base SNAC parameters
+            **kwargs: Additional arguments for SNAC constructor
+
+        Returns:
+            SNACWithSpeakerConditioning instance with pretrained weights
+        """
+        # Load base SNAC model
+        base_model = SNAC.from_pretrained(repo_id, **kwargs)
+
+        # Create conditioned model with same config
+        model = cls(
+            sampling_rate=base_model.sampling_rate,
+            encoder_dim=base_model.encoder_dim,
+            encoder_rates=base_model.encoder_rates,
+            latent_dim=base_model.latent_dim,
+            decoder_dim=base_model.decoder_dim,
+            decoder_rates=base_model.decoder_rates,
+            attn_window_size=base_model.attn_window_size,
+            codebook_size=base_model.codebook_size,
+            codebook_dim=base_model.codebook_dim,
+            vq_strides=base_model.vq_strides,
+            speaker_emb_dim=speaker_emb_dim,
+            freeze_base=freeze_base,
+        )
+
+        # Copy pretrained weights to base model
+        model.base_model.load_state_dict(base_model.state_dict())
+
+        return model

@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.nn.utils.parametrizations import weight_norm
 
 from .attention import LocalMHA
+from .film import FiLM
 
 
 class Encoder(nn.Module):
@@ -156,6 +157,139 @@ class DecoderBlock(nn.Module):
 
     def forward(self, x):
         return self.block(x)
+
+
+class ResidualUnitWithFiLM(nn.Module):
+    """
+    ResidualUnit with FiLM conditioning applied before the block.
+
+    This is identical to ResidualUnit but applies FiLM modulation based on
+    a conditioning vector (e.g., speaker embedding) before processing.
+
+    Args:
+        dim: Number of channels
+        dilation: Dilation factor for convolutions
+        kernel: Kernel size
+        groups: Number of groups for grouped convolutions
+        cond_dim: Dimension of conditioning vector
+
+    Input:
+        x: (B, C, T) input features
+        cond: (B, cond_dim) conditioning vector
+
+    Output:
+        (B, C, T) output features with residual connection
+    """
+
+    def __init__(self, dim=16, dilation=1, kernel=7, groups=1, cond_dim=512):
+        super().__init__()
+        self.film = FiLM(num_features=dim, cond_dim=cond_dim)
+
+        pad = ((kernel - 1) * dilation) // 2
+        self.block = nn.Sequential(
+            Snake1d(dim),
+            WNConv1d(dim, dim, kernel_size=kernel, dilation=dilation, padding=pad, groups=groups),
+            Snake1d(dim),
+            WNConv1d(dim, dim, kernel_size=1),
+        )
+
+    def forward(self, x, cond):
+        """
+        Apply FiLM conditioning then residual block.
+
+        Args:
+            x: (B, C, T) input features
+            cond: (B, cond_dim) conditioning vector
+
+        Returns:
+            (B, C, T) output features with residual connection
+        """
+        # Apply FiLM conditioning to input
+        x_film = self.film(x, cond)
+
+        # Apply residual block to conditioned features
+        y = self.block(x_film)
+
+        # Handle padding from strided convolutions
+        pad = (x.shape[-1] - y.shape[-1]) // 2
+        if pad > 0:
+            x = x[..., pad:-pad]
+
+        # Residual connection (use original x, not x_film)
+        return x + y
+
+
+class DecoderBlockWithFiLM(nn.Module):
+    """
+    DecoderBlock with FiLM conditioning before each ResidualUnit.
+
+    This is identical to DecoderBlock but replaces ResidualUnits with
+    ResidualUnitWithFiLM, allowing speaker conditioning at multiple scales.
+
+    Args:
+        input_dim: Input channel dimension
+        output_dim: Output channel dimension
+        stride: Upsampling stride for transposed convolution
+        noise: Whether to add noise injection (for training)
+        groups: Number of groups for grouped convolutions
+        cond_dim: Dimension of conditioning vector (e.g., speaker embedding)
+
+    Input:
+        x: (B, input_dim, T) input features
+        cond: (B, cond_dim) conditioning vector
+
+    Output:
+        (B, output_dim, T') upsampled and conditioned output features
+    """
+
+    def __init__(self, input_dim=16, output_dim=8, stride=1, noise=False, groups=1, cond_dim=512):
+        super().__init__()
+
+        # Upsampling layers
+        layers = [
+            Snake1d(input_dim),
+            WNConvTranspose1d(
+                input_dim,
+                output_dim,
+                kernel_size=2 * stride,
+                stride=stride,
+                padding=math.ceil(stride / 2),
+                output_padding=stride % 2,
+            ),
+        ]
+
+        # Optional noise injection for training stability
+        if noise:
+            layers.append(NoiseBlock(output_dim))
+
+        self.upsample = nn.Sequential(*layers)
+
+        # ResidualUnits with FiLM conditioning at different dilations
+        # Each dilation provides a different receptive field
+        self.res1 = ResidualUnitWithFiLM(output_dim, dilation=1, groups=groups, cond_dim=cond_dim)
+        self.res2 = ResidualUnitWithFiLM(output_dim, dilation=3, groups=groups, cond_dim=cond_dim)
+        self.res3 = ResidualUnitWithFiLM(output_dim, dilation=9, groups=groups, cond_dim=cond_dim)
+
+    def forward(self, x, cond):
+        """
+        Upsample and apply conditioned residual units.
+
+        Args:
+            x: (B, input_dim, T) input features
+            cond: (B, cond_dim) conditioning vector (speaker embedding)
+
+        Returns:
+            (B, output_dim, T') output features
+        """
+        # Upsample
+        x = self.upsample(x)
+
+        # Apply conditioned residual units
+        x = self.res1(x, cond)
+        x = self.res2(x, cond)
+        x = self.res3(x, cond)
+
+        return x
 
 
 def WNConv1d(*args, **kwargs):
