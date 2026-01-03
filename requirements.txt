@@ -2,3 +2,6 @@ torch
 numpy
 einops
 huggingface_hub
+speechbrain>=0.5.16
+torchaudio>=0.13.0
+tqdm
