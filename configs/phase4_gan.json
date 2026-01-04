@@ -3,12 +3,13 @@
   "description": "Phase 4: GAN training with MPD + MRD discriminators for realistic audio generation",
 
   "pretrained_model": "hubertsiuzdak/snac_24khz",
+  "speaker_encoder_type": "eres2net",
   "speaker_emb_dim": 512,
   "freeze_base": true,
 
   "train_data": "data/train_split",
   "val_data": "data/val_split",
-  "segment_length": 4.0,
+  "segment_length": 2.0,
   "batch_size": 8,
   "num_workers": 4,
 
@@ -30,7 +31,7 @@
 
   "contrastive_weight": 0.5,
   "contrastive_margin": 0.1,
-  "max_negatives": 8,
+  "max_negatives": 6,
   "same_speaker_threshold": 0.85,
   "contrastive_on_val": false,
 

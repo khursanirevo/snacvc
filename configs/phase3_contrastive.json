@@ -1,5 +1,6 @@
 {
   "pretrained_model": "hubertsiuzdak/snac_24khz",
+  "speaker_encoder_type": "ecapa",
   "speaker_emb_dim": 512,
   "freeze_base": true,
   "train_data": "data/train_split",

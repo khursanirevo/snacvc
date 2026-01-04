@@ -46,6 +46,7 @@ class SpeakerEncoder(nn.Module):
             from speechbrain.inference.speaker import SpeakerRecognition
 
             # Load pretrained ECAPA-TDNN model
+            # Note: Model is loaded on CPU, will be moved to GPU in first forward pass
             self.model = SpeakerRecognition.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
                 savedir="pretrained_models/speechbrain_ecapa",
@@ -71,6 +72,9 @@ class SpeakerEncoder(nn.Module):
             for param in self.model.parameters():
                 param.requires_grad = False
             self.model.eval()
+            # Also freeze the embedding model specifically
+            if hasattr(self.model, 'mods') and hasattr(self.model.mods, 'embedding_model'):
+                self.model.mods.embedding_model.eval()
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
         """
@@ -88,20 +92,30 @@ class SpeakerEncoder(nn.Module):
         resampler = self.resampler.to(device)
         audio_16k = resampler(audio).to(device)
 
+        # ECAPA-TDNN expects (B, T) format - remove channel dim
+        # audio shape is (B, 1, T), we need (B, T)
+        if audio_16k.dim() == 3:
+            audio_16k = audio_16k.squeeze(1)  # (B, 1, T) -> (B, T)
+
+        # Ensure audio is on the correct device
+        audio_16k = audio_16k.to(device)
+
+        # CRITICAL: Move ALL model components to device BEFORE forward pass
+        # This includes mods, embedding_model, and all submodules
+        self.model = self.model.to(device)
+        if hasattr(self.model, 'mods'):
+            self.model.mods = self.model.mods.to(device)
+            if hasattr(self.model.mods, 'embedding_model'):
+                self.model.mods.embedding_model = self.model.mods.embedding_model.to(device)
+
         # Extract embeddings using frozen ECAPA-TDNN
         with torch.no_grad():
-            # SpeechBrain expects (B, T), remove channel dim and ensure on device
-            audio_16k = audio_16k.squeeze(1).to(device)
+            # Manually compute what encode_batch does, but ensure wav_lens is on correct device
+            # wav_lens: relative lengths (1.0 = full length for all samples after padding)
+            wav_lens = torch.ones(audio_16k.shape[0], device=device)
 
-            # Encode batch - returns (B, 1, 192)
-            model_device = next(self.model.parameters()).device
-            if model_device != device:
-                self.model = self.model.to(device)
-            embeddings = self.model.encode_batch(audio_16k)
-
-            # Remove extra dimension if present
-            if embeddings.dim() == 3:
-                embeddings = embeddings.squeeze(1)  # (B, 192)
+            # Get embeddings directly from embedding_model
+            embeddings = self.model.mods.embedding_model(audio_16k, wav_lens=wav_lens)
 
         # Project to target embedding dimension
         embeddings = self.proj(embeddings)  # (B, embedding_dim)

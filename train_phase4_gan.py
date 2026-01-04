@@ -136,15 +136,19 @@ def reconstruction_loss(audio_original, audio_reconstructed, config):
 
 def contrastive_speaker_loss(model, audio, codes, speaker_embs, config):
     """
-    Contrastive speaker loss with negative sampling.
-    (Reused from Phase 3)
+    Contrastive speaker loss with hard negative mining.
+
+    Improvements:
+    - Hard negative mining: selects negatives with similarity 0.5-0.85 (semi-hard)
+    - Falls back to semi-hard: 0.3-0.85 if not enough hard negatives
+    - Random sampling within tiers for diversity
     """
     B = audio.shape[0]
     device = audio.device
     original_lengths = [audio[i].shape[-1] for i in range(B)]
 
     recon_losses = []
-    num_negatives = min(B - 1, config.get('max_negatives', 8))  # Reduced from 15 for memory
+    num_negatives = min(B - 1, config.get('max_negatives', 8))
     similarity_matrix = F.cosine_similarity(speaker_embs.unsqueeze(1), speaker_embs.unsqueeze(0), dim=-1)
     same_speaker_threshold = config.get('same_speaker_threshold', 0.85)
 
@@ -158,23 +162,56 @@ def contrastive_speaker_loss(model, audio, codes, speaker_embs, config):
         loss_positive = reconstruction_loss(audio[i:i+1], audio_positive, config)
         recon_losses.append(loss_positive)
 
-        # Negatives
-        negatives_used = 0
-        for j in range(B):
-            if j == i:
-                continue
-            if similarity_matrix[i, j].item() > same_speaker_threshold:
-                continue
+        # Hard negative mining: prioritize semi-hard negatives
+        # Tier 1: Hard negatives (similarity 0.5-0.85) - most informative
+        hard_mask = (similarity_matrix[i] >= 0.5) & (similarity_matrix[i] < same_speaker_threshold) & (torch.arange(B, device=device) != i)
+        hard_indices = torch.where(hard_mask)[0]
 
+        # Tier 2: Semi-hard negatives (similarity 0.3-0.85)
+        semi_hard_mask = (similarity_matrix[i] >= 0.3) & (similarity_matrix[i] < same_speaker_threshold) & (torch.arange(B, device=device) != i)
+        semi_hard_indices = torch.where(semi_hard_mask)[0]
+
+        # Tier 3: All valid negatives (similarity < 0.85)
+        all_mask = (similarity_matrix[i] < same_speaker_threshold) & (torch.arange(B, device=device) != i)
+        all_indices = torch.where(all_mask)[0]
+
+        # Select negatives with priority
+        selected_indices = []
+        if len(hard_indices) > 0:
+            # Prefer hard negatives - randomly sample from them
+            perm = torch.randperm(len(hard_indices), device=device)
+            selected_from_hard = hard_indices[perm][:num_negatives]
+            selected_indices.append(selected_from_hard)
+
+        remaining = num_negatives - len(selected_indices)
+        if remaining > 0 and len(semi_hard_indices) > len(hard_indices):
+            # Fill remaining with semi-hard (excluding already selected)
+            semi_hard_remaining = semi_hard_indices[~torch.isin(semi_hard_indices, torch.cat(selected_indices) if len(selected_indices) > 0 else torch.tensor([], device=device))]
+            if len(semi_hard_remaining) > 0:
+                perm = torch.randperm(len(semi_hard_remaining), device=device)
+                selected_indices.append(semi_hard_remaining[perm][:remaining])
+                remaining = num_negatives - sum(len(idx) for idx in selected_indices)
+
+        if remaining > 0:
+            # Final fallback: all valid negatives
+            all_remaining = all_indices[~torch.isin(all_indices, torch.cat(selected_indices) if len(selected_indices) > 0 else torch.tensor([], device=device))]
+            if len(all_remaining) > 0:
+                perm = torch.randperm(len(all_remaining), device=device)
+                selected_indices.append(all_remaining[perm][:remaining])
+
+        if len(selected_indices) > 0:
+            selected_indices = torch.cat(selected_indices)[:num_negatives]
+        else:
+            # Shouldn't happen, but safety fallback
+            selected_indices = torch.tensor([j for j in range(B) if j != i], device=device)[:num_negatives]
+
+        # Decode with selected negative speaker embeddings
+        for j in selected_indices:
             speaker_emb_negative = speaker_embs[j:j+1]
             audio_negative = model.decode(codes_i, speaker_embedding=speaker_emb_negative)
             audio_negative = audio_negative[..., :original_lengths[i]]
             loss_negative = reconstruction_loss(audio[i:i+1], audio_negative, config)
             recon_losses.append(loss_negative)
-
-            negatives_used += 1
-            if negatives_used >= num_negatives:
-                break
 
     # Margin-based contrastive loss
     negative_losses = []
@@ -447,6 +484,7 @@ def main(config, resume_path=None, device_id=0):
     model = SNACWithSpeakerConditioning.from_pretrained_base(
         repo_id=config['pretrained_model'],
         speaker_emb_dim=config['speaker_emb_dim'],
+        speaker_encoder_type=config.get('speaker_encoder_type', 'ecapa'),
         freeze_base=config['freeze_base'],
     ).to(device)
 

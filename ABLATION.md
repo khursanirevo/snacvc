@@ -201,6 +201,9 @@ uv run python inference.py \
 
 ## Results Summary
 
+**IMPORTANT**: All results below use **ECAPA-TDNN pretrained encoder** (not simple trainable encoder).
+See "Critical Bug Fixes" section for details on the speaker encoder bug fix.
+
 ### Phase 1 & 2: Failed ❌
 - **Problem**: Unrealistic audio output
 - **Symptoms**: Beeping, random frequency lines
@@ -226,17 +229,87 @@ uv run python inference.py \
 
 ## Critical Bug Fixes
 
-### Bug #1: Feature Matching = 0 ✅ FIXED
+### Bug #1: Wrong Speaker Encoder (CRITICAL) ✅ FIXED
+**Problem**: All training phases were using `simple_speaker_encoder.py` (trainable from scratch) instead of pretrained speaker model
+**Root Cause**: Hardcoded import of simple encoder in SNAC model initialization
+**Impact**:
+- No pretrained speaker knowledge
+- Random embeddings
+- Poor speaker conditioning
+- Documentation mismatch (claimed to use ECAPA-TDNN)
+**Discovery**: User found this bug during Phase 4 training and immediately stopped training
+**Solution**: Implemented factory pattern for configurable speaker encoders
+- Added `snac/speaker_encoder_factory.py` for encoder selection
+- Added `speaker_encoder_type` parameter to all configs
+- Updated all training scripts to pass encoder type
+- Default: ECAPA-TDNN (pretrained on VoxCeleb, frozen)
+**Files Modified**:
+- `snac/speaker_encoder_factory.py` (NEW)
+- `snac/snac.py` - Added `speaker_encoder_type` parameter
+- All 4 config files - Added `"speaker_encoder_type": "ecapa"`
+- All 3 training scripts - Pass encoder type to model
+- `test_speaker_encoders.py` (NEW) - Test script
+**Impact**: All training phases now use ECAPA-TDNN pretrained encoder
+
+### Bug #2: Feature Matching = 0 ✅ FIXED
 - **Problem**: Feature matching loss stuck at 0
 - **Root Cause**: Wrong discriminator forward calls
 - **Fix**: Single forward pass with (real, fake) inputs
 - **Impact**: Generator can now learn from discriminator features
 
-### Bug #2: Discriminator Too Strong ✅ FIXED
+### Bug #3: Discriminator Too Strong ✅ FIXED
 - **Problem**: D_loss → 0.5, adv_loss → 2.66
 - **Root Cause**: 2 discriminators at same LR as generator
 - **Fix**: Halved discriminator LR (0.0001 → 0.00005)
 - **Impact**: Balanced adversarial training
+
+## Speaker Encoder Configuration
+
+All training phases use the factory pattern for configurable speaker encoder selection.
+
+### Current Default: ECAPA-TDNN ✅
+- **Type**: Pretrained on VoxCeleb
+- **Params**: 20M parameters
+- **Status**: Frozen during training
+- **Config**: `"speaker_encoder_type": "ecapa"` (default in all configs)
+- **Why**: Proven performance, pretrained on large speaker verification dataset
+
+### Alternative: ERes2NetV2 (Experimental) ⚠️
+- **Type**: Pretrained on VoxCeleb (from GPT-SoVITS)
+- **Params**: 34M parameters
+- **Status**: Frozen during training
+- **Config**: `"speaker_encoder_type": "eres2net"`
+- **Why experimental**: Checkpoint architecture mismatch, not production-ready
+
+### Deprecated: Simple Encoder ❌
+- **Type**: Trainable from scratch
+- **Config**: `"speaker_encoder_type": "simple"`
+- **Why deprecated**: Not pretrained, poor speaker conditioning quality
+- **Status**: Kept only for backward compatibility
+
+### Switching Encoders
+
+Simply change the `speaker_encoder_type` in your config file:
+
+```json
+{
+  "speaker_encoder_type": "ecapa",  // or "eres2net"
+  "speaker_emb_dim": 512
+}
+```
+
+All training scripts will automatically use the specified encoder.
+
+### Testing
+
+```bash
+# Test speaker encoders
+uv run python test_speaker_encoders.py
+
+# Expected:
+# ✅ ECAPA-TDNN encoder works correctly
+# ⚠️  ERes2NetV2 encoder: SKIP/Fail (experimental)
+```
 
 ## Decision Framework
 
@@ -328,13 +401,16 @@ nvidia-smi
 
 After extensive ablation, **Phase 4 (GAN training)** is the clear winner:
 - ✅ Realistic audio generation
-- ✅ Proper speaker conditioning
+- ✅ Proper speaker conditioning with ECAPA-TDNN pretrained encoder
 - ✅ Stable training dynamics
 - ✅ Frequent checkpointing for safety
 
 The key insights:
-1. Self-conditioning alone is insufficient (Phases 1-3)
-2. Adversarial supervision is essential for realism (Phase 4)
-3. Feature matching preserves detailed structure
-4. Discriminator learning rate must be balanced
-5. Step-based checkpointing prevents data loss
+1. **Pretrained speaker encoder is critical** - ECAPA-TDNN provides strong speaker embeddings (Bug #3 fix)
+2. Self-conditioning alone is insufficient (Phases 1-3)
+3. Adversarial supervision is essential for realism (Phase 4)
+4. Feature matching preserves detailed structure (Bug #2 fix)
+5. Discriminator learning rate must be balanced (Bug #3 fix)
+6. Step-based checkpointing prevents data loss
+
+**Note**: All training should be done with ECAPA-TDNN encoder (the default in all config files).

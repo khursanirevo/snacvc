@@ -386,6 +386,7 @@ def main(config, resume_path=None, device_id=0):
     model = SNACWithSpeakerConditioning.from_pretrained_base(
         repo_id=config['pretrained_model'],
         speaker_emb_dim=config['speaker_emb_dim'],
+        speaker_encoder_type=config.get('speaker_encoder_type', 'ecapa'),
         freeze_base=config['freeze_base'],
     )
     model = model.to(device)

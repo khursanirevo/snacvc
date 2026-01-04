@@ -57,46 +57,53 @@ The implementation went through multiple phases to achieve high-quality speaker-
    - Initialized to identity transformation (gamma=1, beta=0)
    - Used for modulating decoder features based on speaker embeddings
 
-2. **`snac/speaker_encoder.py`** - Speaker embedding extraction
-   - Uses ECAPA-TDNN from SpeechBrain (pretrained)
+2. **`snac/speaker_encoder_factory.py`** - Speaker encoder factory
+   - Factory pattern for configurable speaker encoder selection
+   - Supports multiple encoder types (see "Speaker Encoder Options" below)
+   - ECAPA-TDNN is the default (pretrained, frozen)
+
+3. **`snac/speaker_encoder.py`** - ECAPA-TDNN speaker encoder
+   - Uses ECAPA-TDNN from SpeechBrain (pretrained on VoxCeleb)
    - Extracts 192-dim embeddings, projects to 512-dim
    - L2-normalized for stability
    - Automatically resamples audio to 16kHz (ECAPA-TDNN requirement)
+   - **Status**: Frozen during training (not trainable)
 
-3. **`snac/discriminators.py`** - GAN discriminators for realistic audio generation
+4. **`snac/discriminators.py`** - GAN discriminators for realistic audio generation
    - **MultiPeriodDiscriminator (MPD)**: 5 sub-discriminators with periods [2, 3, 5, 7, 11]
    - **MultiResolutionSTFTDiscriminator (MRD)**: 3 discriminators with FFT sizes [1024, 2048, 4096]
    - Time-domain and frequency-domain adversarial supervision
    - Feature matching for detailed audio structure preservation
 
-4. **`snac/layers.py`** - Modified with conditioned decoder blocks
+5. **`snac/layers.py`** - Modified with conditioned decoder blocks
    - Added `ResidualUnitWithFiLM` - ResidualUnit with FiLM conditioning
    - Added `DecoderBlockWithFiLM` - DecoderBlock with conditioned ResidualUnits
    - 12 FiLM layers total (4 DecoderBlocks × 3 ResidualUnits each)
 
-5. **`snac/snac.py`** - New conditioned model class
+6. **`snac/snac.py`** - New conditioned model class
    - `SNACWithSpeakerConditioning` - Full model with speaker conditioning
    - Freezes base SNAC model
    - Only trains FiLM parameters (~4.5M trainable out of 24.3M total)
    - `from_pretrained_base()` classmethod for loading pretrained SNAC
+   - Configurable speaker encoder via `speaker_encoder_type` parameter
 
-6. **`snac/__init__.py`** - Updated exports
+7. **`snac/__init__.py`** - Updated exports
    - Now exports: `SNAC`, `SNACWithSpeakerConditioning`, `MultiPeriodDiscriminator`, `MultiResolutionSTFTDiscriminator`
 
 ### Training Scripts
 
-7. **`train.py`** - Phase 1 & 2 reconstruction training
+8. **`train.py`** - Phase 1 & 2 reconstruction training
    - `SpeakerDataset` class for multi-speaker audio datasets
    - Multi-scale spectral reconstruction loss
    - Speaker consistency loss (Phase 2)
    - Training loop with gradient clipping and learning rate scheduling
 
-8. **`train_contrastive.py`** - Phase 3 contrastive training
+9. **`train_contrastive.py`** - Phase 3 contrastive training
    - Contrastive speaker loss for better speaker discrimination
    - Hard negative mining
    - Balanced positive/negative pairs
 
-9. **`train_phase4_gan.py`** - Phase 4 GAN training ⭐ **RECOMMENDED**
+10. **`train_phase4_gan.py`** - Phase 4 GAN training ⭐ **RECOMMENDED**
    - Multi-Period Discriminator (MPD) for time-domain adversarial loss
    - Multi-Resolution STFT Discriminator (MRD) for frequency-domain adversarial loss
    - Feature matching loss to preserve detailed audio structure
@@ -104,14 +111,14 @@ The implementation went through multiple phases to achieve high-quality speaker-
    - **Step-based checkpointing** (every 4000 batches)
    - **Balanced discriminator learning** (0.5× generator LR)
 
-10. **`inference.py`** - Speaker manipulation inference
+11. **`inference.py`** - Speaker manipulation inference
    - Two modes:
      - `manipulate`: Change speaker while preserving content
      - `reconstruct`: Test reconstruction quality
    - Loads trained checkpoints
    - Handles audio loading, resampling, and saving
 
-11. **`requirements.txt`** - Updated dependencies
+12. **`requirements.txt`** - Updated dependencies
    - Added: `speechbrain>=0.5.16`, `torchaudio>=0.13.0`, `tqdm`
 
 ## Critical Bug Fixes
@@ -139,6 +146,37 @@ y_d_rs_mpd, y_d_gs_mpd, fmap_rs_mpd, fmap_gs_mpd = mpd(audio, audio_hat)
 "disc_learning_rate": 0.00005  // Discriminators (0.5×)
 ```
 **Impact**: Training now balanced with adv loss 0.3-0.8
+
+### Bug #3: Wrong Speaker Encoder (CRITICAL) ✅ FIXED
+**Problem**: Phase 4 training was using `simple_speaker_encoder.py` (trainable from scratch) instead of pretrained speaker model
+**Root Cause**: Hardcoded import of simple encoder in SNAC model initialization
+**Impact**:
+- No pretrained speaker knowledge
+- Random embeddings
+- Poor speaker conditioning
+- Documentation mismatch (claimed to use ECAPA-TDNN)
+**Solution**: Implemented factory pattern for configurable speaker encoders
+```python
+# OLD (WRONG):
+from .simple_speaker_encoder import SpeakerEncoder
+self.speaker_encoder = SpeakerEncoder(...)
+
+# NEW (CORRECT):
+from .speaker_encoder_factory import SpeakerEncoderFactory
+self.speaker_encoder = SpeakerEncoderFactory.create(
+    encoder_type=speaker_encoder_type,  # From config
+    embedding_dim=speaker_emb_dim,
+    snac_sample_rate=sampling_rate,
+    freeze=True  # Always freeze pretrained encoders
+)
+```
+**Files Modified**:
+- `snac/speaker_encoder_factory.py` (NEW) - Factory for encoder selection
+- `snac/snac.py` - Added `speaker_encoder_type` parameter
+- All 4 config files - Added `"speaker_encoder_type": "ecapa"`
+- All 3 training scripts - Pass encoder type to model
+- `test_speaker_encoders.py` (NEW) - Test script
+**Impact**: Training now uses ECAPA-TDNN pretrained encoder (pretrained on VoxCeleb, frozen)
 
 ## Architecture
 
@@ -188,6 +226,77 @@ Audio Output → Real + Fake
 MPD (5 sub-discs) + MRD (3 sub-discs)
     ↓
 Adversarial Loss + Feature Matching Loss
+```
+
+## Speaker Encoder Options
+
+The speaker encoder is configurable via JSON config files using the `speaker_encoder_type` parameter.
+
+### Available Encoders
+
+#### 1. ECAPA-TDNN (Default, Recommended) ✅
+- **Type**: Pretrained on VoxCeleb
+- **Params**: 20M parameters
+- **Input**: Raw audio at 16kHz (auto-resampled from SNAC sample rate)
+- **Output**: 192-dim → 512-dim projection, L2-normalized
+- **Status**: Frozen during training
+- **Pros**:
+  - Pretrained on large speaker verification dataset
+  - Proven performance in production
+  - Easy to install (SpeechBrain)
+- **Config**: `"speaker_encoder_type": "ecapa"`
+- **Install**: `uv pip install speechbrain>=0.5.16`
+
+#### 2. ERes2NetV2 (Experimental) ⚠️
+- **Type**: Pretrained on VoxCeleb (from GPT-SoVITS)
+- **Params**: 34M parameters
+- **Input**: Kaldi fbank features (80 mel bins at 16kHz)
+- **Output**: 512-dim direct, L2-normalized
+- **Status**: Frozen during training
+- **Pros**:
+  - Superior short-duration speaker verification
+  - Used in GPT-SoVITS ProPlus (production voice cloning)
+  - No projection needed (direct 512-dim)
+- **Cons**:
+  - **Experimental**: Checkpoint architecture mismatch
+  - Requires downloading pretrained weights
+- **Config**: `"speaker_encoder_type": "eres2net"`
+- **Install**: `uv run python scripts/download_eres2net.py`
+
+#### 3. Simple (DEPRECATED) ❌
+- **Type**: Trainable from scratch (1D convolutions)
+- **Params**: ~500K parameters
+- **Input**: Raw audio at SNAC sample rate
+- **Output**: 512-dim, L2-normalized
+- **Status**: Trainable (but deprecated)
+- **Why Deprecated**: Not pretrained, poor speaker conditioning quality
+- **Config**: `"speaker_encoder_type": "simple"`
+- **Warning**: Do not use - kept only for backward compatibility
+
+### Switching Encoders
+
+Simply change the `speaker_encoder_type` in your config file:
+
+```json
+{
+  "speaker_encoder_type": "ecapa",  // or "eres2net"
+  "speaker_emb_dim": 512,
+  "freeze_base": true
+}
+```
+
+All training scripts will automatically use the specified encoder.
+
+### Testing Speaker Encoders
+
+```bash
+# Test all encoders
+uv run python test_speaker_encoders.py
+
+# Expected output:
+# ✅ ECAPA-TDNN encoder works correctly
+# ⚠️  ERes2NetV2 encoder: SKIP/Fail (experimental)
+# ✅ Simple encoder works (deprecated)
 ```
 
 ## Usage Examples
@@ -344,33 +453,46 @@ Batch 2000: g_loss=1.44, d_loss=1.22, recon=0.23, contrast=0.06, adv=0.33,  fm=0
 - DecoderBlock 4: 96 channels × 3 ResidualUnits
 
 **Speaker Encoder**:
-- Model: ECAPA-TDNN (SpeechBrain pretrained)
+- Factory pattern for configurable encoder selection
+- Default: ECAPA-TDNN (SpeechBrain pretrained on VoxCeleb)
+- Alternative: ERes2NetV2 (experimental, from GPT-SoVITS)
+- Deprecated: Simple trainable encoder (do not use)
 - Input: Audio at 16kHz (auto-resampled from SNAC sample rate)
 - Output: 512-dim L2-normalized embeddings
-- Status: Always frozen
+- Status: Always frozen during training
+- Config: `"speaker_encoder_type": "ecapa"` in config files
 
 ## File Structure
 
 ```
 /mnt/data/work/snac/
 ├── snac/
-│   ├── __init__.py                    # Exports all components
-│   ├── snac.py                        # SNACWithSpeakerConditioning
-│   ├── layers.py                      # Conditioned decoder blocks
-│   ├── film.py                        # FiLM layer implementation
-│   ├── speaker_encoder.py             # ECAPA-TDNN integration
-│   ├── discriminators.py              # MPD + MRD discriminators (NEW)
-│   ├── vq.py                          # Vector quantization
-│   └── attention.py                   # Local attention
+│   ├── __init__.py                      # Exports all components
+│   ├── snac.py                          # SNACWithSpeakerConditioning
+│   ├── layers.py                        # Conditioned decoder blocks
+│   ├── film.py                          # FiLM layer implementation
+│   ├── speaker_encoder_factory.py       # Factory for encoder selection (NEW)
+│   ├── speaker_encoder.py               # ECAPA-TDNN integration
+│   ├── simple_speaker_encoder.py        # Simple trainable encoder (DEPRECATED)
+│   ├── eres2net_encoder.py              # ERes2NetV2 wrapper (EXPERIMENTAL)
+│   ├── discriminators.py                # MPD + MRD discriminators
+│   ├── vq.py                            # Vector quantization
+│   └── attention.py                     # Local attention
 ├── configs/
-│   └── phase4_gan.json                # Phase 4 GAN training config
-├── train.py                           # Phase 1 & 2 training
-├── train_contrastive.py               # Phase 3 contrastive training
-├── train_phase4_gan.py                # Phase 4 GAN training (RECOMMENDED)
-├── inference.py                       # Speaker manipulation inference
-├── requirements.txt                   # Dependencies
+│   ├── phase1_reconstruction_only.json  # Phase 1 config
+│   ├── phase2_with_speaker_loss.json    # Phase 2 config
+│   ├── phase3_contrastive.json          # Phase 3 config
+│   └── phase4_gan.json                  # Phase 4 GAN training config
+├── scripts/
+│   └── download_eres2net.py             # Download ERes2NetV2 weights
+├── train.py                             # Phase 1 & 2 training
+├── train_contrastive.py                 # Phase 3 contrastive training
+├── train_phase4_gan.py                  # Phase 4 GAN training (RECOMMENDED)
+├── test_speaker_encoders.py             # Test script for encoders
+├── inference.py                         # Speaker manipulation inference
+├── requirements.txt                     # Dependencies
 └── logs/phase4/
-    └── training.log                   # Training logs
+    └── training.log                     # Training logs
 ```
 
 ## Current Status

@@ -154,6 +154,7 @@ class SNACWithSpeakerConditioning(nn.Module):
         noise=True,
         depthwise=True,
         speaker_emb_dim=512,
+        speaker_encoder_type='ecapa',  # NEW: Configurable speaker encoder (ECAPA-TDNN default)
         freeze_base=True,
     ):
         super().__init__()
@@ -192,11 +193,14 @@ class SNACWithSpeakerConditioning(nn.Module):
                 param.requires_grad = False
             self.base_model.eval()
 
-        # Speaker encoder (use simple version to avoid speechbrain compatibility issues)
-        from .simple_speaker_encoder import SpeakerEncoder
-        self.speaker_encoder = SpeakerEncoder(
+        # Speaker encoder (pretrained, frozen)
+        # Uses factory pattern to support multiple encoder types
+        from .speaker_encoder_factory import SpeakerEncoderFactory
+        self.speaker_encoder = SpeakerEncoderFactory.create(
+            encoder_type=speaker_encoder_type,
             embedding_dim=speaker_emb_dim,
-            snac_sample_rate=sampling_rate
+            snac_sample_rate=sampling_rate,
+            freeze=True  # Always freeze pretrained encoders
         )
 
         # Build conditioned decoder
@@ -364,6 +368,7 @@ class SNACWithSpeakerConditioning(nn.Module):
         cls,
         repo_id: str,
         speaker_emb_dim: int = 512,
+        speaker_encoder_type: str = 'ecapa',  # NEW
         freeze_base: bool = True,
         **kwargs
     ):
@@ -373,6 +378,7 @@ class SNACWithSpeakerConditioning(nn.Module):
         Args:
             repo_id: HuggingFace repo ID (e.g., "hubertsiuzdak/snac_24khz")
             speaker_emb_dim: Dimension of speaker embedding
+            speaker_encoder_type: Type of speaker encoder ('eres2net', 'ecapa', 'simple')
             freeze_base: Whether to freeze base SNAC parameters
             **kwargs: Additional arguments for SNAC constructor
 
@@ -395,6 +401,7 @@ class SNACWithSpeakerConditioning(nn.Module):
             codebook_dim=base_model.codebook_dim,
             vq_strides=base_model.vq_strides,
             speaker_emb_dim=speaker_emb_dim,
+            speaker_encoder_type=speaker_encoder_type,  # NEW
             freeze_base=freeze_base,
         )
 
