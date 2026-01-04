@@ -28,7 +28,7 @@ from snac.discriminators import MultiPeriodDiscriminator, MultiResolutionSTFTDis
 from snac.faiss_speaker_index import FaissSpeakerIndex
 from snac.voice_conversion_loss import voice_conversion_loss
 from snac.embedding_cache import OptimizedEmbeddingCache
-from snac.audio_augmentation import augment_audio_for_voice_conversion
+from snac.audio_augmentation import augment_audio_for_voice_conversion, augment_audio_for_voice_conversion_advanced
 # Codebook adversarial loss is optional and not recommended
 try:
     from snac.codebook_adversarial_loss import SpeakerDiscriminator, adversarial_codebook_loss_v2, GradientReversal
@@ -466,15 +466,30 @@ def train_epoch(model, mpd, mrd, dataloader, opt_gen, opt_disc, device, config,
             for i in range(audio.shape[0]):
                 if random.random() < synthetic_aug_prob:
                     t0 = time_module.time()
-                    # Apply pitch shift
+                    # Apply pitch shift and formant shift
                     audio_i = audio[i:i+1]  # (1, 1, T)
                     t1 = time_module.time()
 
-                    audio_aug, was_aug, semitones = augment_audio_for_voice_conversion(
-                        audio_i,
-                        pitch_shift_range=pitch_shift_range,
-                        probability=1.0  # Always augment in this loop
-                    )
+                    # Check if formant shifting is enabled
+                    use_formant = config.get('use_formant_shift', False)
+                    formant_range = config.get('formant_shift_range', [])
+
+                    if use_formant and formant_range:
+                        # Advanced augmentation with formant shift
+                        audio_aug, was_aug, semitones, formant_shift = augment_audio_for_voice_conversion_advanced(
+                            audio_i,
+                            pitch_shift_range=pitch_shift_range,
+                            formant_shift_range=formant_range,
+                            probability=1.0  # Always augment in this loop
+                        )
+                    else:
+                        # Regular pitch shift only
+                        audio_aug, was_aug, semitones = augment_audio_for_voice_conversion(
+                            audio_i,
+                            pitch_shift_range=pitch_shift_range,
+                            probability=1.0  # Always augment in this loop
+                        )
+                        formant_shift = 0.0
                     t2 = time_module.time()
 
                     if was_aug:
