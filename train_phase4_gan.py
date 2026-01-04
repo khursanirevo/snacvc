@@ -26,6 +26,7 @@ from snac.discriminators import MultiPeriodDiscriminator, MultiResolutionSTFTDis
 from snac.faiss_speaker_index import FaissSpeakerIndex
 from snac.voice_conversion_loss import voice_conversion_loss
 from snac.embedding_cache import OptimizedEmbeddingCache
+from snac.audio_augmentation import augment_audio_for_voice_conversion
 # Codebook adversarial loss is optional and not recommended
 try:
     from snac.codebook_adversarial_loss import SpeakerDiscriminator, adversarial_codebook_loss_v2, GradientReversal
@@ -388,6 +389,7 @@ def train_epoch(model, mpd, mrd, dataloader, opt_gen, opt_disc, device, config,
     total_loss_recon = 0
     total_loss_contrast = 0
     total_loss_speaker_match = 0
+    total_loss_synthetic_vc = 0
     total_loss_adv = 0
     total_loss_fm = 0
     total_loss_codebook_adv = 0
@@ -444,6 +446,50 @@ def train_epoch(model, mpd, mrd, dataloader, opt_gen, opt_disc, device, config,
                 embedding_cache=embedding_cache
             )
 
+        # Synthetic voice conversion loss (audio augmentation)
+        # Apply pitch shifting to create pseudo-speaker pairs
+        # Teaches model to trust embedding over acoustic patterns in codes
+        synthetic_vc_loss = torch.tensor(0.0, device=device)
+        use_synthetic_vc = config.get('use_synthetic_vc', False)
+        if use_synthetic_vc and num_batches > 10:  # Warmup period
+            # Apply augmentation to random subset
+            synthetic_aug_prob = config.get('synthetic_vc_probability', 0.5)
+            pitch_shift_range = config.get('pitch_shift_range', [-2, -1, 1, 2])
+
+            # Process each sample in batch
+            synthetic_losses = []
+            for i in range(audio.shape[0]):
+                if random.random() < synthetic_aug_prob:
+                    # Apply pitch shift
+                    audio_i = audio[i:i+1]  # (1, 1, T)
+                    audio_aug, was_aug, semitones = augment_audio_for_voice_conversion(
+                        audio_i,
+                        pitch_shift_range=pitch_shift_range,
+                        probability=1.0  # Always augment in this loop
+                    )
+
+                    if was_aug:
+                        # Encode augmented audio
+                        codes_aug = model_base.encode(audio_aug)
+
+                        # Reconstruct with ORIGINAL speaker embedding
+                        # This teaches: embedding dominates codes for speaker identity
+                        speaker_emb_i = speaker_embs[i:i+1]
+
+                        # Get length for trimming
+                        original_length = audio[i].shape[-1]
+
+                        # Decode with original embedding
+                        audio_synthetic_recon = model_base.decode(codes_aug, speaker_embedding=speaker_emb_i)
+                        audio_synthetic_recon = audio_synthetic_recon[..., :original_length]
+
+                        # Reconstruction loss: should match ORIGINAL audio (not augmented)
+                        loss_synth = reconstruction_loss(audio[i:i+1], audio_synthetic_recon, config)
+                        synthetic_losses.append(loss_synth)
+
+            if synthetic_losses:
+                synthetic_vc_loss = torch.stack(synthetic_losses).mean()
+
         # Adversarial losses (skip for first few batches to stabilize)
         loss_adv = torch.tensor(0.0, device=device)
         loss_fm = torch.tensor(0.0, device=device)
@@ -488,7 +534,11 @@ def train_epoch(model, mpd, mrd, dataloader, opt_gen, opt_disc, device, config,
         # Total generator loss
         # Note: vc_losses['total'] already includes its own weighted reconstruction
         # We add the main reconstruction loss separately to ensure good quality
-        loss_gen = loss_recon + vc_losses['total'] + lambda_adv * loss_adv + lambda_fm * loss_fm + loss_codebook_adv_enc
+        lambda_synthetic = config.get('lambda_synthetic', 0.3)
+        loss_gen = (loss_recon + vc_losses['total'] +
+                    lambda_synthetic * synthetic_vc_loss +
+                    lambda_adv * loss_adv + lambda_fm * loss_fm +
+                    loss_codebook_adv_enc)
 
         loss_gen.backward()
         if config.get('grad_clip', 0) > 0:
@@ -545,6 +595,7 @@ def train_epoch(model, mpd, mrd, dataloader, opt_gen, opt_disc, device, config,
         total_loss_recon += loss_recon.item()
         total_loss_contrast += vc_losses['total'].item()
         total_loss_speaker_match += vc_losses['speaker_matching'].item()
+        total_loss_synthetic_vc += synthetic_vc_loss.item()
         total_loss_adv += loss_adv.item()
         total_loss_fm += loss_fm.item()
         total_loss_codebook_adv += loss_codebook_adv_enc.item()
@@ -559,6 +610,8 @@ def train_epoch(model, mpd, mrd, dataloader, opt_gen, opt_disc, device, config,
         if use_contrastive:
             postfix['vc'] = vc_losses['total'].item()
             postfix['spk'] = vc_losses['speaker_matching'].item()
+        if use_synthetic_vc and num_batches > 10:
+            postfix['synth'] = synthetic_vc_loss.item()
         if use_gan and num_batches > 10:
             postfix['adv'] = loss_adv.item()
             postfix['fm'] = loss_fm.item()
@@ -596,6 +649,7 @@ def train_epoch(model, mpd, mrd, dataloader, opt_gen, opt_disc, device, config,
         'recon': total_loss_recon / num_batches,
         'contrast': total_loss_contrast / num_batches,
         'speaker_match': total_loss_speaker_match / num_batches,
+        'synthetic_vc': total_loss_synthetic_vc / num_batches,
         'adv': total_loss_adv / num_batches,
         'fm': total_loss_fm / num_batches,
         'codebook_adv': total_loss_codebook_adv / num_batches,
@@ -944,8 +998,9 @@ def main(config, resume_path=None, device_id=0, use_ddp=False):
                         f"Recon: {train_metrics['recon']:.4f}")
             if train_metrics['contrast'] > 0:
                 train_str += (f", VC: {train_metrics['contrast']:.4f}, "
-                            f"SpkMatch: {train_metrics['speaker_match']:.4f}, "
-                            f"CntPres: {train_metrics['content_pres']:.4f}")
+                            f"SpkMatch: {train_metrics['speaker_match']:.4f}")
+            if train_metrics['synthetic_vc'] > 0:
+                train_str += f", SynthVC: {train_metrics['synthetic_vc']:.4f}"
             if train_metrics['adv'] > 0:
                 train_str += f", Adv: {train_metrics['adv']:.4f}, FM: {train_metrics['fm']:.4f}"
             if train_metrics['codebook_adv'] > 0:
