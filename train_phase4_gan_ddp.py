@@ -47,7 +47,7 @@ def main():
 
     # Launch training
     result = subprocess.run(cmd, env=env, check=False)
-    sys.exit(result.return_code)
+    sys.exit(result.returncode)
 
 if __name__ == "__main__":
     main()
