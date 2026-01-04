@@ -28,7 +28,8 @@ from snac.discriminators import MultiPeriodDiscriminator, MultiResolutionSTFTDis
 from snac.faiss_speaker_index import FaissSpeakerIndex
 from snac.voice_conversion_loss import voice_conversion_loss
 from snac.embedding_cache import OptimizedEmbeddingCache
-from snac.audio_augmentation import augment_audio_for_voice_conversion
+from snac.audio_augmentation import augment_audio_for_voice_conversion, augment_audio_for_voice_conversion_advanced
+from snac.whisper_content_loss import WhisperContentLoss
 # Codebook adversarial loss is optional and not recommended
 try:
     from snac.codebook_adversarial_loss import SpeakerDiscriminator, adversarial_codebook_loss_v2, GradientReversal
@@ -460,21 +461,33 @@ def train_epoch(model, mpd, mrd, dataloader, opt_gen, opt_disc, device, config,
             # Apply augmentation to random subset
             synthetic_aug_prob = config.get('synthetic_vc_probability', 0.5)
             pitch_shift_range = config.get('pitch_shift_range', [-2, -1, 1, 2])
+            formant_shift_range = config.get('formant_shift_range', [-0.2, -0.1, 0.1, 0.2])
+            use_formant_shift = config.get('use_formant_shift', False)
 
             # Process each sample in batch
             synthetic_losses = []
             for i in range(audio.shape[0]):
                 if random.random() < synthetic_aug_prob:
                     t0 = time_module.time()
-                    # Apply pitch shift
+                    # Apply pitch shift + formant shift
                     audio_i = audio[i:i+1]  # (1, 1, T)
                     t1 = time_module.time()
 
-                    audio_aug, was_aug, semitones = augment_audio_for_voice_conversion(
-                        audio_i,
-                        pitch_shift_range=pitch_shift_range,
-                        probability=1.0  # Always augment in this loop
-                    )
+                    # Use advanced augmentation if formant shift enabled
+                    if use_formant_shift:
+                        audio_aug, was_aug, semitones, formant_shift = augment_audio_for_voice_conversion_advanced(
+                            audio_i,
+                            pitch_shift_range=pitch_shift_range,
+                            formant_shift_range=formant_shift_range,
+                            probability=1.0  # Always augment in this loop
+                        )
+                    else:
+                        audio_aug, was_aug, semitones = augment_audio_for_voice_conversion(
+                            audio_i,
+                            pitch_shift_range=pitch_shift_range,
+                            probability=1.0  # Always augment in this loop
+                        )
+                        formant_shift = 0.0
                     t2 = time_module.time()
 
                     if was_aug:
@@ -557,8 +570,17 @@ def train_epoch(model, mpd, mrd, dataloader, opt_gen, opt_disc, device, config,
         # Note: vc_losses['total'] already includes its own weighted reconstruction
         # We add the main reconstruction loss separately to ensure good quality
         lambda_synthetic = config.get('lambda_synthetic', 0.3)
+
+        # Whisper content loss (preserves linguistic content)
+        loss_content = torch.tensor(0.0, device=device)
+        if whisper_content_loss is not None:
+            loss_content = whisper_content_loss(audio, audio_hat)
+            if is_main and num_batches % 100 == 0:
+                pbar.write(f"Content loss: {loss_content.item():.4f}")
+
         loss_gen = (loss_recon + vc_losses['total'] +
                     lambda_synthetic * synthetic_vc_loss +
+                    loss_content +
                     lambda_adv * loss_adv + lambda_fm * loss_fm +
                     loss_codebook_adv_enc)
 
@@ -634,6 +656,8 @@ def train_epoch(model, mpd, mrd, dataloader, opt_gen, opt_disc, device, config,
             postfix['spk'] = vc_losses['speaker_matching'].item()
         if use_synthetic_vc and num_batches > 10:
             postfix['synth'] = synthetic_vc_loss.item()
+        if whisper_content_loss is not None:
+            postfix['content'] = loss_content.item()
         if use_gan and num_batches > 10:
             postfix['adv'] = loss_adv.item()
             postfix['fm'] = loss_fm.item()
@@ -766,12 +790,24 @@ def main(config, resume_path=None, device_id=0, use_ddp=False):
         repo_id=config['pretrained_model'],
         speaker_emb_dim=config['speaker_emb_dim'],
         speaker_encoder_type=config.get('speaker_encoder_type', 'eres2net'),
+        conditioning_type=config.get('conditioning_type', 'film'),  # Phase 5: 'film' or 'cross_attention'
+        num_heads=config.get('num_heads', 8),  # Phase 5: attention heads for cross-attention
         freeze_base=config['freeze_base'],
     ).to(device)
 
     # Create discriminators
     mpd = MultiPeriodDiscriminator(periods=config.get('mpd_periods', [2, 3, 5, 7, 11])).to(device)
     mrd = MultiResolutionSTFTDiscriminator(fft_sizes=config.get('mrd_fft_sizes', [1024, 2048, 4096])).to(device)
+
+    # Create Whisper content loss module (if enabled)
+    whisper_content_loss = None
+    if config.get('use_content_loss', False):
+        if is_main:
+            print("Initializing Whisper content loss...")
+        whisper_content_loss = WhisperContentLoss(
+            model_size=config.get('content_loss_model', 'large-v3'),
+            device=device
+        )
 
     # Create speaker discriminator for codebook adversarial training
     # (Will be initialized after we know the number of speakers from dataset)

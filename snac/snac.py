@@ -116,11 +116,11 @@ class SNAC(nn.Module):
 
 class SNACWithSpeakerConditioning(nn.Module):
     """
-    SNAC with speaker conditioning using FiLM layers.
+    SNAC with speaker conditioning using FiLM or Cross-Attention layers.
 
     This model wraps a pretrained SNAC model and adds speaker conditioning
-    to the decoder using FiLM (Feature-wise Linear Modulation) layers.
-    The base SNAC model is frozen, and only the FiLM parameters are trained.
+    to the decoder using configurable conditioning mechanisms.
+    The base SNAC model is frozen, and only the conditioning parameters are trained.
 
     Args:
         sampling_rate: Audio sample rate (default: from pretrained)
@@ -136,6 +136,9 @@ class SNACWithSpeakerConditioning(nn.Module):
         noise: Whether to use noise in decoder
         depthwise: Whether to use depthwise convolutions
         speaker_emb_dim: Dimension of speaker embedding (default: 512)
+        speaker_encoder_type: Type of speaker encoder ('eres2net', 'ecapa', 'simple')
+        conditioning_type: Type of speaker conditioning ('film' or 'cross_attention')
+        num_heads: Number of attention heads (for cross-attention)
         freeze_base: Whether to freeze base SNAC model (default: True)
     """
 
@@ -154,7 +157,9 @@ class SNACWithSpeakerConditioning(nn.Module):
         noise=True,
         depthwise=True,
         speaker_emb_dim=512,
-        speaker_encoder_type='ecapa',  # NEW: Configurable speaker encoder (ECAPA-TDNN default)
+        speaker_encoder_type='ecapa',  # Configurable speaker encoder (ECAPA-TDNN default)
+        conditioning_type='film',  # NEW: 'film' or 'cross_attention'
+        num_heads=8,  # NEW: Number of attention heads for cross-attention
         freeze_base=True,
     ):
         super().__init__()
@@ -186,6 +191,9 @@ class SNACWithSpeakerConditioning(nn.Module):
         self.n_codebooks = len(vq_strides)
         self.codebook_size = codebook_size
         self.codebook_dim = codebook_dim
+        self.conditioning_type = conditioning_type
+        self.num_heads = num_heads
+        self.speaker_emb_dim = speaker_emb_dim  # Store for later use
 
         # Freeze base model parameters
         if freeze_base:
@@ -204,11 +212,11 @@ class SNACWithSpeakerConditioning(nn.Module):
         )
 
         # Build conditioned decoder
-        self._build_conditioned_decoder(speaker_emb_dim)
+        self._build_conditioned_decoder(speaker_emb_dim, conditioning_type, num_heads)
 
-    def _build_conditioned_decoder(self, cond_dim):
-        """Build decoder with FiLM conditioning."""
-        from .layers import DecoderBlockWithFiLM, WNConv1d
+    def _build_conditioned_decoder(self, cond_dim, conditioning_type='film', num_heads=8):
+        """Build decoder with configurable speaker conditioning."""
+        from .layers import DecoderBlockWithSpeakerConditioning, WNConv1d
 
         channels = self.decoder_dim
         rates = self.decoder_rates
@@ -227,7 +235,7 @@ class SNACWithSpeakerConditioning(nn.Module):
 
         self.initial_layers = nn.Sequential(*layers)
 
-        # DecoderBlocks with FiLM conditioning
+        # DecoderBlocks with flexible conditioning (FiLM or Cross-Attention)
         self.decoder_blocks = nn.ModuleList()
         for i, stride in enumerate(rates):
             input_dim = channels // 2**i
@@ -235,13 +243,15 @@ class SNACWithSpeakerConditioning(nn.Module):
             groups = output_dim  # depthwise=True
 
             self.decoder_blocks.append(
-                DecoderBlockWithFiLM(
+                DecoderBlockWithSpeakerConditioning(
                     input_dim=input_dim,
                     output_dim=output_dim,
                     stride=stride,
                     noise=True,
                     groups=groups,
-                    cond_dim=cond_dim
+                    cond_dim=cond_dim,
+                    conditioning_type=conditioning_type,
+                    num_heads=num_heads
                 )
             )
 
@@ -311,8 +321,7 @@ class SNACWithSpeakerConditioning(nn.Module):
         if speaker_embedding is None:
             # Zero conditioning (no speaker modification)
             B = z_q.shape[0]
-            cond_dim = self.decoder_blocks[0].res1.film.gamma_fc.out_features
-            speaker_embedding = torch.zeros(B, cond_dim, device=z_q.device, dtype=z_q.dtype)
+            speaker_embedding = torch.zeros(B, self.speaker_emb_dim, device=z_q.device, dtype=z_q.dtype)
 
         # Pass through conditioned decoder
         x = self.initial_layers(z_q)
@@ -368,7 +377,9 @@ class SNACWithSpeakerConditioning(nn.Module):
         cls,
         repo_id: str,
         speaker_emb_dim: int = 512,
-        speaker_encoder_type: str = 'ecapa',  # NEW
+        speaker_encoder_type: str = 'ecapa',
+        conditioning_type: str = 'film',  # NEW
+        num_heads: int = 8,  # NEW
         freeze_base: bool = True,
         **kwargs
     ):
@@ -379,6 +390,8 @@ class SNACWithSpeakerConditioning(nn.Module):
             repo_id: HuggingFace repo ID (e.g., "hubertsiuzdak/snac_24khz")
             speaker_emb_dim: Dimension of speaker embedding
             speaker_encoder_type: Type of speaker encoder ('eres2net', 'ecapa', 'simple')
+            conditioning_type: Type of speaker conditioning ('film' or 'cross_attention')
+            num_heads: Number of attention heads (for cross-attention)
             freeze_base: Whether to freeze base SNAC parameters
             **kwargs: Additional arguments for SNAC constructor
 
@@ -401,7 +414,9 @@ class SNACWithSpeakerConditioning(nn.Module):
             codebook_dim=base_model.codebook_dim,
             vq_strides=base_model.vq_strides,
             speaker_emb_dim=speaker_emb_dim,
-            speaker_encoder_type=speaker_encoder_type,  # NEW
+            speaker_encoder_type=speaker_encoder_type,
+            conditioning_type=conditioning_type,  # NEW
+            num_heads=num_heads,  # NEW
             freeze_base=freeze_base,
         )
 

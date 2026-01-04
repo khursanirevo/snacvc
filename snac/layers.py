@@ -292,6 +292,160 @@ class DecoderBlockWithFiLM(nn.Module):
         return x
 
 
+class ResidualUnitWithSpeakerConditioning(nn.Module):
+    """
+    ResidualUnit with flexible speaker conditioning (FiLM or Cross-Attention).
+
+    This is a generalized version of ResidualUnitWithFiLM that supports
+    multiple conditioning mechanisms through the SpeakerConditioningLayer wrapper.
+
+    Args:
+        dim: Number of channels
+        dilation: Dilation factor for convolutions
+        kernel: Kernel size
+        groups: Number of groups for grouped convolutions
+        cond_dim: Dimension of conditioning vector
+        conditioning_type: Type of conditioning ('film' or 'cross_attention')
+        num_heads: Number of attention heads (for cross-attention)
+
+    Input:
+        x: (B, C, T) input features
+        cond: (B, cond_dim) conditioning vector
+
+    Output:
+        (B, C, T) output features with residual connection
+    """
+
+    def __init__(self, dim=16, dilation=1, kernel=7, groups=1, cond_dim=512,
+                 conditioning_type='film', num_heads=8):
+        super().__init__()
+        from .cross_attention import SpeakerConditioningLayer
+
+        self.conditioning = SpeakerConditioningLayer(
+            num_features=dim,
+            speaker_emb_dim=cond_dim,
+            conditioning_type=conditioning_type,
+            num_heads=num_heads
+        )
+
+        pad = ((kernel - 1) * dilation) // 2
+        self.block = nn.Sequential(
+            Snake1d(dim),
+            WNConv1d(dim, dim, kernel_size=kernel, dilation=dilation, padding=pad, groups=groups),
+            Snake1d(dim),
+            WNConv1d(dim, dim, kernel_size=1),
+        )
+
+    def forward(self, x, cond):
+        """
+        Apply speaker conditioning then residual block.
+
+        Args:
+            x: (B, C, T) input features
+            cond: (B, cond_dim) conditioning vector
+
+        Returns:
+            (B, C, T) output features with residual connection
+        """
+        # Apply conditioning (FiLM or Cross-Attention)
+        x_cond = self.conditioning(x, cond)
+
+        # Apply residual block to conditioned features
+        y = self.block(x_cond)
+
+        # Handle padding from strided convolutions
+        pad = (x.shape[-1] - y.shape[-1]) // 2
+        if pad > 0:
+            x = x[..., pad:-pad]
+
+        # Residual connection (use original x, not x_cond)
+        return x + y
+
+
+class DecoderBlockWithSpeakerConditioning(nn.Module):
+    """
+    DecoderBlock with flexible speaker conditioning (FiLM or Cross-Attention).
+
+    This is a generalized version of DecoderBlockWithFiLM that supports
+    multiple conditioning mechanisms.
+
+    Args:
+        input_dim: Input channel dimension
+        output_dim: Output channel dimension
+        stride: Upsampling stride for transposed convolution
+        noise: Whether to add noise injection (for training)
+        groups: Number of groups for grouped convolutions
+        cond_dim: Dimension of conditioning vector
+        conditioning_type: Type of conditioning ('film' or 'cross_attention')
+        num_heads: Number of attention heads (for cross-attention)
+
+    Input:
+        x: (B, input_dim, T) input features
+        cond: (B, cond_dim) conditioning vector
+
+    Output:
+        (B, output_dim, T') upsampled and conditioned output features
+    """
+
+    def __init__(self, input_dim=16, output_dim=8, stride=1, noise=False, groups=1,
+                 cond_dim=512, conditioning_type='film', num_heads=8):
+        super().__init__()
+
+        # Upsampling layers
+        layers = [
+            Snake1d(input_dim),
+            WNConvTranspose1d(
+                input_dim,
+                output_dim,
+                kernel_size=2 * stride,
+                stride=stride,
+                padding=math.ceil(stride / 2),
+                output_padding=stride % 2,
+            ),
+        ]
+
+        # Optional noise injection for training stability
+        if noise:
+            layers.append(NoiseBlock(output_dim))
+
+        self.upsample = nn.Sequential(*layers)
+
+        # ResidualUnits with speaker conditioning at different dilations
+        self.res1 = ResidualUnitWithSpeakerConditioning(
+            output_dim, dilation=1, groups=groups, cond_dim=cond_dim,
+            conditioning_type=conditioning_type, num_heads=num_heads
+        )
+        self.res2 = ResidualUnitWithSpeakerConditioning(
+            output_dim, dilation=3, groups=groups, cond_dim=cond_dim,
+            conditioning_type=conditioning_type, num_heads=num_heads
+        )
+        self.res3 = ResidualUnitWithSpeakerConditioning(
+            output_dim, dilation=9, groups=groups, cond_dim=cond_dim,
+            conditioning_type=conditioning_type, num_heads=num_heads
+        )
+
+    def forward(self, x, cond):
+        """
+        Upsample and apply conditioned residual units.
+
+        Args:
+            x: (B, input_dim, T) input features
+            cond: (B, cond_dim) conditioning vector (speaker embedding)
+
+        Returns:
+            (B, output_dim, T') output features
+        """
+        # Upsample
+        x = self.upsample(x)
+
+        # Apply conditioned residual units
+        x = self.res1(x, cond)
+        x = self.res2(x, cond)
+        x = self.res3(x, cond)
+
+        return x
+
+
 def WNConv1d(*args, **kwargs):
     return weight_norm(nn.Conv1d(*args, **kwargs))
 

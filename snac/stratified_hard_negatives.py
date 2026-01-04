@@ -76,10 +76,11 @@ class StratifiedHardNegativeSampler:
         valid_paths = []
 
         for path in self.faiss_index.file_paths:
-            if path in self.embedding_cache:
-                emb = self.embedding_cache[path].numpy()
-                all_embs.append(emb)
-                valid_paths.append(path)
+            if path in self.embedding_cache.path_to_idx:
+                emb = self.embedding_cache.get(path)
+                if emb is not None:
+                    all_embs.append(emb.numpy())
+                    valid_paths.append(path)
 
         all_embs = np.vstack(all_embs).astype('float32')
 
@@ -225,8 +226,9 @@ class StratifiedHardNegativeSampler:
         # Return embeddings
         negative_embs = []
         for path in selected[:self.num_negatives]:
-            emb = self.embedding_cache[path]
-            negative_embs.append(emb)
+            emb = self.embedding_cache.get(path)
+            if emb is not None:
+                negative_embs.append(emb)
 
         return negative_embs
 
@@ -268,7 +270,7 @@ def get_stratified_negatives_legacy(model, query_embedding: torch.Tensor,
             continue
 
         path = faiss_index.file_paths[idx]
-        if path not in embedding_cache:
+        if path not in embedding_cache.path_to_idx:
             continue
 
         if sim < threshold_easy_medium:
@@ -313,6 +315,8 @@ def get_stratified_negatives_legacy(model, query_embedding: torch.Tensor,
     # Return embeddings
     negative_embs = []
     for path in selected[:num_negatives]:
-        negative_embs.append(embedding_cache[path])
+        emb = embedding_cache.get(path)
+        if emb is not None:
+            negative_embs.append(emb)
 
     return negative_embs

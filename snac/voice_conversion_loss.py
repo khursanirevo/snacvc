@@ -160,7 +160,7 @@ def voice_conversion_loss(model, audio, codes, speaker_embs, config, faiss_index
                 )
             else:
                 # ORIGINAL: Just use most similar speakers
-                query_emb = speaker_embs[i].cpu().numpy()
+                query_emb = speaker_embs[i].detach().cpu().numpy()
                 k = num_negatives + 1
                 distances, indices, _ = faiss_index.search(query_emb, k=k)
 
@@ -168,8 +168,8 @@ def voice_conversion_loss(model, audio, codes, speaker_embs, config, faiss_index
                 for idx in indices:
                     if idx >= 0 and idx < len(faiss_index.file_paths):
                         neg_path = faiss_index.file_paths[idx]
-                        if neg_path in embedding_cache:
-                            emb = embedding_cache[neg_path]
+                        emb = embedding_cache.get(neg_path)
+                        if emb is not None:
                             hard_neg_embs.append(emb)
                             if len(hard_neg_embs) >= num_negatives:
                                 break
