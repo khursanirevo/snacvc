@@ -4,8 +4,9 @@ Speaker encoder factory for configurable encoder selection.
 Supports multiple pretrained speaker encoders:
 - ERes2NetV2 (GPT-SoVITS) - default, best performance
 - ECAPA-TDNN (SpeechBrain) - alternative, good performance
+- Simple (trainable CNN) - lightweight, for older checkpoints
 
-CRITICAL: All encoders MUST use pretrained weights. Training will crash if weights fail to load.
+CRITICAL: All encoders except 'simple' MUST use pretrained weights.
 """
 
 from typing import Optional
@@ -26,6 +27,11 @@ class SpeakerEncoderFactory:
             'description': 'ECAPA-TDNN from SpeechBrain (pretrained, frozen, 20M params)',
             'default': False,
         },
+        'simple': {
+            'class': 'snac.simple_speaker_encoder.SimpleSpeakerEncoder',
+            'description': 'Simple trainable CNN (lightweight, for older checkpoints)',
+            'default': False,
+        },
     }
 
     @classmethod
@@ -41,7 +47,7 @@ class SpeakerEncoderFactory:
         Create a speaker encoder instance.
 
         Args:
-            encoder_type: Type of encoder ('eres2net', 'ecapa')
+            encoder_type: Type of encoder ('eres2net', 'ecapa', 'simple')
             embedding_dim: Output embedding dimension
             snac_sample_rate: SNAC model's sample rate
             freeze: Whether to freeze encoder weights (always True for pretrained)
@@ -80,6 +86,13 @@ class SpeakerEncoderFactory:
             return ECAPAEncoder(
                 embedding_dim=embedding_dim,
                 freeze=freeze,
+                snac_sample_rate=snac_sample_rate
+            )
+
+        elif encoder_type == 'simple':
+            from .simple_speaker_encoder import SimpleSpeakerEncoder
+            return SimpleSpeakerEncoder(
+                embedding_dim=embedding_dim,
                 snac_sample_rate=snac_sample_rate
             )
 
