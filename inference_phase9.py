@@ -4,10 +4,13 @@ Phase 9 Inference: Evaluate reconstruction quality on custom data.
 
 Tests L1 and STFT reconstruction losses on audio files from specified directories.
 Phase 9 is simple SNAC fine-tuning (no speaker conditioning, no adapters).
+
+Compares original SNAC model vs fine-tuned checkpoint.
 """
 
 import json
 import argparse
+import random
 from pathlib import Path
 
 import torch
@@ -56,8 +59,9 @@ def load_model(checkpoint_path, device):
     return model, config
 
 
-def evaluate_directory(model, directory, device, segment_length=2.0, batch_size=64):
-    """Evaluate reconstruction loss on all audio files in directory using batching."""
+def evaluate_directory(model, directory, device, segment_length=2.0, batch_size=64,
+                        num_samples=None, seed=42):
+    """Evaluate reconstruction loss on audio files using batching with random sampling."""
     directory = Path(directory)
 
     # Find all audio files
@@ -70,7 +74,13 @@ def evaluate_directory(model, directory, device, segment_length=2.0, batch_size=
         print(f"⚠️  No audio files found in {directory}")
         return None
 
-    print(f"\n📁 Evaluating {len(audio_files)} files from {directory}")
+    # Random sampling if num_samples is specified
+    if num_samples is not None and num_samples < len(audio_files):
+        random.seed(seed)
+        audio_files = random.sample(audio_files, num_samples)
+        print(f"\n📁 Randomly sampled {num_samples} files from {len(audio_files)} total in {directory}")
+    else:
+        print(f"\n📁 Evaluating {len(audio_files)} files from {directory}")
 
     # Collect all segments first
     print("Loading and segmenting audio files...")
@@ -164,16 +174,20 @@ def evaluate_directory(model, directory, device, segment_length=2.0, batch_size=
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Phase 9 Inference - Reconstruction Evaluation")
+    parser = argparse.ArgumentParser(description="Phase 9 Inference - Compare Base vs Fine-tuned")
     parser.add_argument("--checkpoint", type=str,
                         default="checkpoints/phase9_conservative/best_model.pt",
-                        help="Path to checkpoint file")
+                        help="Path to fine-tuned checkpoint file")
     parser.add_argument("--data_dirs", type=str, nargs='+', required=True,
                         help="Directories containing audio files to evaluate")
     parser.add_argument("--segment_length", type=float, default=2.0,
                         help="Segment length in seconds for evaluation")
     parser.add_argument("--batch_size", type=int, default=64,
                         help="Batch size for inference (larger = faster GPU utilization)")
+    parser.add_argument("--num_samples", type=int, default=5000,
+                        help="Number of random files to sample (reproducible)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for sampling")
     parser.add_argument("--output", type=str, default="evaluation_results.json",
                         help="Output JSON file for results")
     parser.add_argument("--device", type=str, default="cuda:3",
@@ -185,59 +199,131 @@ def main():
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(f"Random seed: {args.seed}")
+    print(f"Number of samples per directory: {args.num_samples}")
 
-    # Load model
-    model, config = load_model(args.checkpoint, device)
-
-    # Update n_ffts from config if available
+    # Load fine-tuned model
+    print("\n" + "="*70)
+    print("Loading Fine-tuned Model")
+    print("="*70)
+    model_ft, config = load_model(args.checkpoint, device)
     n_ffts = config.get('n_ffts', args.n_ffts)
     print(f"Using n_ffts={n_ffts} for STFT loss")
 
-    # Evaluate each directory
-    results = {}
-    for data_dir in args.data_dirs:
-        metrics = evaluate_directory(
-            model, data_dir, device,
-            segment_length=args.segment_length,
-            batch_size=args.batch_size
-        )
-        if metrics:
-            dir_name = Path(data_dir).name
-            results[dir_name] = metrics
-
-    # Print summary
+    # Load base pretrained model for comparison
     print("\n" + "="*70)
-    print("EVALUATION SUMMARY")
+    print("Loading Base Pretrained Model")
+    print("="*70)
+    model_name = config.get('pretrained_model', 'hubertsiuzdak/snac_24khz')
+    print(f"Loading from: {model_name}")
+    model_base = SNAC.from_pretrained(model_name).to(device)
+    model_base.eval()
+    print("✅ Base model loaded")
+
+    # Evaluate both models on each directory
+    all_results = {}
+
+    for data_dir in args.data_dirs:
+        dir_name = Path(data_dir).name
+        print("\n" + "="*70)
+        print(f"Evaluating: {dir_name}")
+        print("="*70)
+
+        # Evaluate base model
+        print("\n🔵 BASE MODEL (pretrained)")
+        metrics_base = evaluate_directory(
+            model_base, data_dir, device,
+            segment_length=args.segment_length,
+            batch_size=args.batch_size,
+            num_samples=args.num_samples,
+            seed=args.seed
+        )
+
+        # Evaluate fine-tuned model
+        print("\n🟢 FINE-TUNED MODEL")
+        metrics_ft = evaluate_directory(
+            model_ft, data_dir, device,
+            segment_length=args.segment_length,
+            batch_size=args.batch_size,
+            num_samples=args.num_samples,
+            seed=args.seed
+        )
+
+        if metrics_base and metrics_ft:
+            # Calculate improvement
+            improvement = {
+                'loss': metrics_base['loss'] - metrics_ft['loss'],
+                'l1': metrics_base['l1'] - metrics_ft['l1'],
+                'stft': metrics_base['stft'] - metrics_ft['stft'],
+            }
+
+            all_results[dir_name] = {
+                'base': metrics_base,
+                'finetuned': metrics_ft,
+                'improvement': improvement
+            }
+
+    # Print comparison summary
+    print("\n" + "="*70)
+    print("COMPARISON SUMMARY")
     print("="*70)
 
-    for dir_name, metrics in results.items():
+    for dir_name, results in all_results.items():
+        base = results['base']
+        ft = results['finetuned']
+        imp = results['improvement']
+
         print(f"\n📊 {dir_name}:")
-        print(f"  Files: {metrics['num_files']}, Segments: {metrics['num_segments']}")
-        print(f"  Loss: {metrics['loss']:.4f}")
-        print(f"    L1:   {metrics['l1']:.4f}")
-        print(f"    STFT: {metrics['stft']:.4f}")
+        print(f"  Samples: {base['num_files']} files, {base['num_segments']} segments")
+        print(f"\n  📦 Loss (lower is better):")
+        print(f"     Base:       {base['loss']:.4f}")
+        print(f"     Fine-tuned: {ft['loss']:.4f}")
+        print(f"     Δ:          {imp['loss']:+.4f} ({imp['loss']/base['loss']*100:+.1f}%)")
+        print(f"\n  📏 L1 Loss:")
+        print(f"     Base:       {base['l1']:.4f}")
+        print(f"     Fine-tuned: {ft['l1']:.4f}")
+        print(f"     Δ:          {imp['l1']:+.4f} ({imp['l1']/base['l1']*100:+.1f}%)")
+        print(f"\n  🌊 STFT Loss:")
+        print(f"     Base:       {base['stft']:.4f}")
+        print(f"     Fine-tuned: {ft['stft']:.4f}")
+        print(f"     Δ:          {imp['stft']:+.4f} ({imp['stft']/base['stft']*100:+.1f}%)")
 
-    # Calculate overall average
-    if results:
+    # Overall averages
+    if all_results:
         print("\n" + "-"*70)
-        print("Overall Average:")
-        avg_loss = sum(r['loss'] for r in results.values()) / len(results)
-        avg_l1 = sum(r['l1'] for r in results.values()) / len(results)
-        avg_stft = sum(r['stft'] for r in results.values()) / len(results)
-        total_files = sum(r['num_files'] for r in results.values())
-        total_segments = sum(r['num_segments'] for r in results.values())
+        print("OVERALL AVERAGES (across all directories):")
 
-        print(f"  Files: {total_files}, Segments: {total_segments}")
-        print(f"  Loss: {avg_loss:.4f}")
-        print(f"    L1:   {avg_l1:.4f}")
-        print(f"    STFT: {avg_stft:.4f}")
+        avg_base_loss = sum(r['base']['loss'] for r in all_results.values()) / len(all_results)
+        avg_ft_loss = sum(r['finetuned']['loss'] for r in all_results.values()) / len(all_results)
+        avg_imp_loss = (avg_base_loss - avg_ft_loss) / avg_base_loss * 100
+
+        avg_base_l1 = sum(r['base']['l1'] for r in all_results.values()) / len(all_results)
+        avg_ft_l1 = sum(r['finetuned']['l1'] for r in all_results.values()) / len(all_results)
+        avg_imp_l1 = (avg_base_l1 - avg_ft_l1) / avg_base_l1 * 100
+
+        avg_base_stft = sum(r['base']['stft'] for r in all_results.values()) / len(all_results)
+        avg_ft_stft = sum(r['finetuned']['stft'] for r in all_results.values()) / len(all_results)
+        avg_imp_stft = (avg_base_stft - avg_ft_stft) / avg_base_stft * 100
+
+        print(f"\n  📦 Loss:")
+        print(f"     Base:       {avg_base_loss:.4f}")
+        print(f"     Fine-tuned: {avg_ft_loss:.4f}")
+        print(f"     Δ:          {avg_imp_loss:+.1f}%")
+        print(f"\n  📏 L1:")
+        print(f"     Base:       {avg_base_l1:.4f}")
+        print(f"     Fine-tuned: {avg_ft_l1:.4f}")
+        print(f"     Δ:          {avg_imp_l1:+.1f}%")
+        print(f"\n  🌊 STFT:")
+        print(f"     Base:       {avg_base_stft:.4f}")
+        print(f"     Fine-tuned: {avg_ft_stft:.4f}")
+        print(f"     Δ:          {avg_imp_stft:+.1f}%")
 
     print("="*70 + "\n")
 
     # Save results
     output_path = Path(args.output)
     with open(output_path, 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(all_results, f, indent=2)
     print(f"✅ Results saved to: {output_path}")
 
 

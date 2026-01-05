@@ -1,0 +1,33 @@
+{
+  "experiment_name": "phase9_2x_batch_lr_sqrt",
+  "description": "Ablation: 2x batch with sqrt(2) LR (7.07e-6) - sqrt scaling",
+
+  "pretrained_model": "hubertsiuzdak/snac_24khz",
+
+  "train_data": "data/train_split",
+  "val_data": "data/val_split",
+  "batch_size": 32,
+  "num_workers": 8,
+
+  "num_epochs": 10,
+  "learning_rate": 7.07e-6,
+  "weight_decay": 0.0001,
+  "grad_clip": 1.0,
+  "lr_min_ratio": 0.1,
+  "save_every": 2,
+  "output_dir": "checkpoints/phase9_ablation/2x_batch_lr_sqrt",
+
+  "l1_weight": 1.0,
+  "stft_weight": 1.0,
+  "n_ffts": [1024, 2048, 4096],
+
+  "freeze_encoder": true,
+  "freeze_vq": true,
+
+  "curriculum": [
+    {"epochs": [1, 2], "length": 1.0, "batch_multiplier": 4.0, "comment": "1s segments, 2x batch (128)"},
+    {"epochs": [3, 4], "length": 2.0, "batch_multiplier": 2.0, "comment": "2s segments, 2x batch (64)"},
+    {"epochs": [5, 6], "length": 3.0, "batch_multiplier": 1.34, "comment": "3s segments, 2x batch (43)"},
+    {"epochs": [7, 10], "length": 4.0, "batch_multiplier": 1.0, "comment": "4s segments, 2x batch (32)"}
+  ]
+}
