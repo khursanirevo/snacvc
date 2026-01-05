@@ -1,0 +1,69 @@
+{
+  "experiment_name": "phase6_adapters_before_vq",
+  "description": "Phase 6 with adapter layers BEFORE quantization for speaker-conditioned codes",
+
+  "pretrained_model": "hubertsiuzdak/snac_24khz",
+  "speaker_encoder_type": "eres2net",
+  "speaker_emb_dim": 512,
+  "freeze_base": true,
+
+  "adapter_type": "film",
+  "adapter_hidden_dim": 512,
+  "adapter_num_layers": 2,
+
+  "train_data": "data/train_split",
+  "val_data": "data/val_split",
+  "segment_length": 2.0,
+  "batch_size": 32,
+  "num_workers": 8,
+
+  "num_epochs": 100,
+  "early_stopping_patience": 10,
+  "learning_rate": 1e-4,
+  "disc_learning_rate": 5e-5,
+  "weight_decay": 0.00001,
+  "grad_clip": 1.0,
+  "grad_clip_disc": 1.0,
+  "lr_min_ratio": 0.01,
+  "save_every": 10,
+  "save_every_steps": 500,
+  "output_dir": "checkpoints/phase6",
+
+  "l1_weight": 1.0,
+  "stft_weight": 1.0,
+  "n_ffts": [1024, 2048, 4096],
+
+  "contrastive_weight": 0.5,
+  "max_negatives": 16,
+  "same_speaker_threshold": 0.85,
+  "use_stratified_negatives": true,
+
+  "neg_ratio_easy": 0.3,
+  "neg_ratio_medium": 0.4,
+  "neg_ratio_hard": 0.3,
+  "threshold_easy_medium": 0.3,
+  "threshold_medium_hard": 0.6,
+
+  "lambda_recon": 1.0,
+  "lambda_speaker_matching": 0.5,
+  "lambda_speaker_identity": 0.25,
+  "lambda_speaker_vc": 2.0,
+
+  "use_synthetic_vc": true,
+  "synthetic_vc_probability": 0.5,
+  "pitch_shift_range": [-2, -1, 1, 2],
+  "formant_shift_range": [-0.2, -0.1, 0.1, 0.2],
+  "use_formant_shift": true,
+  "lambda_synthetic": 0.3,
+
+  "gan_weight": 1.0,
+  "lambda_adv": 1.0,
+  "lambda_fm": 2.0,
+
+  "mpd_periods": [2, 3, 5, 7, 11],
+  "mrd_fft_sizes": [1024, 2048, 4096],
+
+  "use_faiss_hard_negatives": true,
+  "faiss_index_path": "pretrained_models/speaker_faiss.index",
+  "comment": "Adapter layers BEFORE quantization: encoder_latent + adapter(speaker_emb) -> conditioned_latent -> VQ -> conditioned_codes"
+}
