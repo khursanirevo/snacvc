@@ -21,7 +21,9 @@ from tqdm import tqdm
 from snac import SNAC
 
 # Import utilities
-from snac.dataset import OptimizedAudioDataset as SimpleAudioDataset
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from train_phase8_multistage import SimpleAudioDataset
 
 
 def reconstruction_loss(audio, audio_hat, config):
