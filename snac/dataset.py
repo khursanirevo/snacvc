@@ -41,6 +41,7 @@ class OptimizedAudioDataset(Dataset):
         extract_speaker_ids=False,
         seed=42,
         min_length_ratio=1.0,  # Skip files shorter than min(segment_length) * ratio
+        filter_short=False,  # Whether to pre-filter short files (SLOW!)
     ):
         """
         Args:
@@ -54,11 +55,13 @@ class OptimizedAudioDataset(Dataset):
             seed: Random seed for reproducibility
             min_length_ratio: Minimum file length as ratio of min(segment_length)
                              (e.g., 1.0 = skip files shorter than shortest segment)
+            filter_short: Whether to pre-filter short files (default: False, much faster)
         """
         self.dataset_root = Path(dataset_root)
         self.sampling_rate = sampling_rate
         self.augment = augment
         self.extract_speaker_ids = extract_speaker_ids
+        self.filter_short = filter_short
 
         # Handle segment_length as either single value or list
         if isinstance(segment_length, (list, tuple)):
@@ -90,8 +93,14 @@ class OptimizedAudioDataset(Dataset):
         if len(self.samples) == 0:
             raise ValueError(f"No audio files found in {dataset_root}")
 
-        # Pre-filter files that are too short using torchaudio.info()
-        self._filter_short_files()
+        # Pre-filter files that are too short (ONLY if requested)
+        if self.filter_short:
+            self._filter_short_files()
+        else:
+            print(f"Skipping pre-filtering (filter_short=False)")
+            if len(self.segment_lengths) > 1:
+                print(f"  Variable segment lengths: {self.segment_lengths}s (random per batch)")
+            print(f"  Short files will be skipped during loading (much faster)")
 
         # Extract speaker IDs from filenames if requested
         self.speaker_to_idx = {}
@@ -104,7 +113,7 @@ class OptimizedAudioDataset(Dataset):
         skipped = 0
 
         min_length_sec = self.min_length / self.sampling_rate
-        print(f"Filtering files shorter than {min_length_sec:.1f}s...")
+        print(f"Filtering files shorter than {min_length_sec:.1f}s (this may take a while)...")
 
         for audio_path in self.samples:
             try:

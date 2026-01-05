@@ -369,24 +369,6 @@ def main():
     print("  Loss: Simple reconstruction (L1 + STFT)")
     print("="*70 + "\n")
 
-    # IMPORTANT: Run validation BEFORE training to establish baseline
-    print("📊 Establishing BASELINE validation metrics (before any training)...")
-    val_metrics_baseline = validate(model, val_loader, device, config)
-    print(f"\n✅ BASELINE (pre-training):")
-    print(f"  Val loss: {val_metrics_baseline['val_loss']:.4f}")
-    print(f"    - L1: {val_metrics_baseline['val_l1']:.4f}")
-    print(f"    - STFT: {val_metrics_baseline['val_stft']:.4f}")
-
-    # Cache baseline
-    baseline_path = output_dir / "baseline_metrics.json"
-    with open(baseline_path, 'w') as f:
-        json.dump(val_metrics_baseline, f, indent=2)
-    print(f"  Cached: {baseline_path}")
-
-    print("\n" + "="*70)
-    print("Starting training...")
-    print("="*70 + "\n")
-
     # Create initial dataloaders
     segment_length, batch_size = get_curriculum_config(start_epoch, config)
     train_loader, val_loader = create_dataloaders(
