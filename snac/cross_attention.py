@@ -49,8 +49,8 @@ class CrossAttentionSpeakerConditioning(nn.Module):
         self.key_proj = nn.Linear(speaker_emb_dim, num_features)
         self.value_proj = nn.Linear(speaker_emb_dim, num_features)
 
-        # Layer norm for features (before projection to queries)
-        self.norm = nn.LayerNorm(num_features)
+        # Group norm works directly with (B, C, T) format
+        self.norm = nn.GroupNorm(num_groups=1, num_channels=num_features)
 
         # Output projection
         self.out_proj = nn.Linear(num_features, num_features)
@@ -79,7 +79,7 @@ class CrossAttentionSpeakerConditioning(nn.Module):
         """
         B, C, T = x.shape
 
-        # Normalize features
+        # Normalize features (GroupNorm works with (B, C, T) directly)
         x_norm = self.norm(x)  # (B, C, T)
 
         # Project speaker embedding to keys and values

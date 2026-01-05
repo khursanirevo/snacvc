@@ -50,14 +50,9 @@ class WhisperContentLoss(nn.Module):
             print("❌ Whisper not installed. Install with: pip install openai-whisper")
             raise ImportError("openai-whisper package required for content loss")
 
-        # Get embedding dimension from Whisper
-        with torch.no_grad():
-            dummy_audio = torch.randn(1, 1, 16000).to(device)  # 1 second at 16kHz
-            dummy_audio = whisper.pad_or_trim(dummy_audio)
-            mel = whisper.log_mel_spectrogram(dummy_audio)
-            encoder_output = self.whisper.encoder(mel)
-            self.embedding_dim = encoder_output.shape[-1]
-
+        # Get embedding dimension from Whisper model config
+        # Whisper's encoder output dimension is model.dims (1280 for large-v3)
+        self.embedding_dim = self.whisper.dims
         print(f"Whisper embedding dimension: {self.embedding_dim}")
 
     def extract_embedding(self, audio: torch.Tensor) -> torch.Tensor:

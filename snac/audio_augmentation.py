@@ -169,23 +169,17 @@ class FormantShifter:
         # Shift formant frequencies by resampling spectral envelope
         # Formant shift > 0: shift envelope up (shorter vocal tract, female-like)
         # Formant shift < 0: shift envelope down (longer vocal tract, male-like)
-        formant_stretched = np.interp(
-            np.linspace(0, 1, len(envelope)),
-            np.linspace(0, 1, len(envelope)),
-            envelope,
-            kind='linear'
-        )
 
         if shift_factor > 0:
             # Shift formants up (compress in frequency)
             new_indices = np.linspace(0, 1, len(envelope))
             stretched_indices = np.clip(new_indices * (1 - shift_factor), 0, 1)
-            formant_stretched = np.interp(new_indices, stretched_indices, envelope, kind='linear')
+            formant_stretched = np.interp(stretched_indices, new_indices, envelope)
         else:
             # Shift formants down (expand in frequency)
             new_indices = np.linspace(0, 1, len(envelope))
             stretched_indices = np.clip(new_indices * (1 + abs(shift_factor)), 0, 1)
-            formant_stretched = np.interp(stretched_indices, new_indices, envelope, kind='linear')
+            formant_stretched = np.interp(new_indices, stretched_indices, envelope)
 
         # Apply formant scaling to each frequency bin
         # Normalize and rescale

@@ -119,9 +119,10 @@ def voice_conversion_loss(model, audio, codes, speaker_embs, config, faiss_index
     original_lengths = [audio[i].shape[-1] for i in range(B)]
     num_negatives = config.get('max_negatives', 6)
 
-    # Extract individual loss components
+    # Extract individual loss components (separated by type)
     reconstruction_losses = []
-    speaker_matching_losses = []
+    speaker_matching_identity_losses = []  # Own embedding
+    speaker_matching_vc_losses = []  # Hard negatives
 
     # Loss weights
     lambda_recon = config.get('lambda_recon', 1.0)
@@ -132,22 +133,44 @@ def voice_conversion_loss(model, audio, codes, speaker_embs, config, faiss_index
     use_stratified_sampling = config.get('use_stratified_negatives', False)
 
     for i in range(B):
-        codes_i = [c[i:i+1] for c in codes]
-
-        # ===== Positive: Own codes + own embedding =====
+        # ===== Positive: Encode with own embedding, decode =====
         speaker_emb_positive = speaker_embs[i:i+1]
-        audio_positive = model_base.decode(codes_i, speaker_embedding=speaker_emb_positive)
-        audio_positive = audio_positive[..., :original_lengths[i]]
+        # For Phase 6: Encode WITH target speaker embedding to get conditioned codes
+        audio_i = audio[i:i+1]
 
-        # 1. Reconstruction loss (should match original)
-        loss_recon = reconstruction_loss(audio[i:i+1], audio_positive, config)
+        # ===== Identity: Compare conditioned vs unconditioned =====
+        # This measures: Does the adapter preserve identity relative to base model?
+
+        # Conditioned reconstruction (with own embedding)
+        codes_cond = model_base.encode(audio_i, speaker_embedding=speaker_emb_positive)
+        audio_cond = model_base.decode(codes_cond)
+        audio_cond = audio_cond[..., :original_lengths[i]]
+
+        # Unconditioned reconstruction (no speaker embedding)
+        codes_uncond = model_base.encode(audio_i, speaker_embedding=None)
+        audio_uncond = model_base.decode(codes_uncond)
+        audio_uncond = audio_uncond[..., :original_lengths[i]]
+
+        # 1. Reconstruction loss (conditioned should match original)
+        loss_recon = reconstruction_loss(audio_i, audio_cond, config)
         reconstruction_losses.append(loss_recon)
 
-        # 2. Speaker matching loss (should match own speaker)
-        loss_speaker_match = speaker_matching_loss(
-            model_base, audio_positive, speaker_emb_positive, config
-        )
-        speaker_matching_losses.append(loss_speaker_match)
+        # 2. Identity loss: conditioned vs unconditioned (should match!)
+        # Both from same audio, so speaker characteristics should be similar
+        emb_cond = model_base.extract_speaker_embedding(audio_cond)
+        emb_uncond = model_base.extract_speaker_embedding(audio_uncond)
+
+        # Normalize and compute cosine similarity
+        emb_cond = F.normalize(emb_cond, dim=-1)
+        emb_uncond = F.normalize(emb_uncond, dim=-1)
+        similarity = F.cosine_similarity(emb_cond, emb_uncond, dim=-1)
+
+        # Loss = 1 - similarity (lower is better)
+        loss_speaker_match_identity = (1.0 - similarity).mean()
+        speaker_matching_identity_losses.append(loss_speaker_match_identity)
+
+        # Keep audio_positive for VC negatives
+        audio_positive = audio_cond
 
         # ===== Negatives: Own codes + other embeddings =====
         if use_faiss:
@@ -177,17 +200,20 @@ def voice_conversion_loss(model, audio, codes, speaker_embs, config, faiss_index
             # Process negatives
             for emb in hard_neg_embs[:num_negatives]:
                 speaker_emb_negative = emb.unsqueeze(0).to(device)
-                audio_negative = model_base.decode(codes_i, speaker_embedding=speaker_emb_negative)
+                # For Phase 6: Encode audio with TARGET speaker embedding
+                # This teaches: encode(audio_A, emb_B) → codes that decode to speaker B
+                codes_negative = model_base.encode(audio_i, speaker_embedding=speaker_emb_negative)
+                audio_negative = model_base.decode(codes_negative)
                 audio_negative = audio_negative[..., :original_lengths[i]]
 
-                # Speaker matching: Should match target (negative) speaker
+                # Speaker matching for VC: Should match target (negative) speaker
                 loss_speaker_neg = speaker_matching_loss(
                     model_base, audio_negative, speaker_emb_negative, config
                 )
-                speaker_matching_losses.append(loss_speaker_neg)
+                speaker_matching_vc_losses.append(loss_speaker_neg)
 
         # Fallback: In-batch negatives if FAISS not available or insufficient
-        if len(speaker_matching_losses) < 1 + num_negatives:
+        if len(speaker_matching_vc_losses) < num_negatives:
             # Compute similarity matrix
             similarity_matrix = F.cosine_similarity(
                 speaker_embs.unsqueeze(1), speaker_embs.unsqueeze(0), dim=-1
@@ -223,29 +249,45 @@ def voice_conversion_loss(model, audio, codes, speaker_embs, config, faiss_index
             # Process in-batch negatives
             for j in selected_indices:
                 speaker_emb_negative = speaker_embs[j:j+1]
-                audio_negative = model_base.decode(codes_i, speaker_embedding=speaker_emb_negative)
+                # For Phase 6: Encode audio with TARGET speaker embedding
+                codes_negative = model_base.encode(audio_i, speaker_embedding=speaker_emb_negative)
+                audio_negative = model_base.decode(codes_negative)
                 audio_negative = audio_negative[..., :original_lengths[i]]
 
-                # Speaker matching loss
+                # Speaker matching loss for VC
                 loss_speaker_neg = speaker_matching_loss(
                     model_base, audio_negative, speaker_emb_negative, config
                 )
-                speaker_matching_losses.append(loss_speaker_neg)
+                speaker_matching_vc_losses.append(loss_speaker_neg)
 
     # Aggregate losses
     loss_recon = torch.stack(reconstruction_losses).mean() if reconstruction_losses else torch.tensor(0.0, device=device)
-    loss_speaker = torch.stack(speaker_matching_losses).mean() if speaker_matching_losses else torch.tensor(0.0, device=device)
+    loss_speaker_identity = torch.stack(speaker_matching_identity_losses).mean() if speaker_matching_identity_losses else torch.tensor(0.0, device=device)
+    loss_speaker_vc = torch.stack(speaker_matching_vc_losses).mean() if speaker_matching_vc_losses else torch.tensor(0.0, device=device)
+
+    # Separate weights for identity vs VC speaker losses
+    lambda_speaker_identity = config.get('lambda_speaker_identity', lambda_speaker * 0.5)  # Lower weight for identity
+    lambda_speaker_vc = config.get('lambda_speaker_vc', lambda_speaker * 2.0)  # Higher weight for VC learning
 
     # Combined loss
     total_loss = (
         lambda_recon * loss_recon +
-        lambda_speaker * loss_speaker
+        lambda_speaker_identity * loss_speaker_identity +
+        lambda_speaker_vc * loss_speaker_vc
     )
+
+    # Compute weighted average for logging
+    loss_speaker_combined = (
+        lambda_speaker_identity * loss_speaker_identity +
+        lambda_speaker_vc * loss_speaker_vc
+    ) / (lambda_speaker_identity + lambda_speaker_vc)
 
     return {
         'total': total_loss,
         'reconstruction': loss_recon,
-        'speaker_matching': loss_speaker,
+        'speaker_matching': loss_speaker_combined,
+        'speaker_matching_identity': loss_speaker_identity,
+        'speaker_matching_vc': loss_speaker_vc,
     }
 
 
