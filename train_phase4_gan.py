@@ -645,10 +645,9 @@ def train_epoch(model, mpd, mrd, dataloader, opt_gen, opt_disc, device, config,
             'recon': loss_recon.item()
         }
         if use_contrastive:
+            postfix['synth'] = synthetic_vc_loss.item()
             postfix['vc'] = vc_losses['total'].item()
             postfix['spk'] = vc_losses['speaker_matching'].item()
-        if use_synthetic_vc and num_batches > 10:
-            postfix['synth'] = synthetic_vc_loss.item()
         if use_gan and num_batches > 10:
             postfix['adv'] = loss_adv.item()
             postfix['fm'] = loss_fm.item()
@@ -658,6 +657,7 @@ def train_epoch(model, mpd, mrd, dataloader, opt_gen, opt_disc, device, config,
 
         # Log to file (every batch)
         pbar.write(f"Epoch {epoch}, Batch {num_batches}/{len(dataloader)}: " + ", ".join([f"{k}={v:.4f}" for k, v in postfix.items()]))
+        sys.stdout.flush()  # Force flush to avoid buffering with nohup
 
         # Step-based checkpointing
         current_step = start_step + num_batches
@@ -681,6 +681,7 @@ def train_epoch(model, mpd, mrd, dataloader, opt_gen, opt_disc, device, config,
             checkpoint_path = output_dir / f'step_{current_step}.pt'
             torch.save(checkpoint, checkpoint_path)
             pbar.write(f"Saved checkpoint at step {current_step}")
+            sys.stdout.flush()  # Force flush to avoid buffering with nohup
 
     # Return average losses and total steps
     return {

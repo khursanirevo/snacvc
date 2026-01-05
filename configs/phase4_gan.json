@@ -15,8 +15,8 @@
 
   "num_epochs": 100,
   "early_stopping_patience": 10,
-  "learning_rate": 0.0001,
-  "disc_learning_rate": 0.00008,
+  "learning_rate": 1e-4,
+  "disc_learning_rate": 1e-5,
   "weight_decay": 0.00001,
   "grad_clip": 1.0,
   "grad_clip_disc": 1.0,
@@ -30,7 +30,7 @@
   "n_ffts": [1024, 2048, 4096],
 
   "contrastive_weight": 0.5,
-  "max_negatives": 6,
+  "max_negatives": 10,
   "same_speaker_threshold": 0.85,
   "use_stratified_negatives": true,
 
