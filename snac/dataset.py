@@ -322,3 +322,45 @@ def variable_length_collate(dataset):
     return collate_fn
 
 
+def curriculum_collate(dataset, segment_length):
+    """
+    Collate function for curriculum learning (fixed segment length per epoch).
+
+    Args:
+        dataset: OptimizedAudioDataset instance
+        segment_length: Fixed segment length for this epoch
+
+    Returns:
+        Collate function to use with DataLoader
+    """
+    def collate_fn(batch):
+        # Extract indices
+        indices = [item['idx'] for item in batch if item is not None]
+
+        if len(indices) == 0:
+            return {'audio': torch.empty(0)}
+
+        # Load all samples with the fixed segment length for this epoch
+        batch_data = []
+        for idx in indices:
+            sample = dataset.load_audio(idx, segment_length)
+            if sample is not None:
+                batch_data.append(sample)
+
+        if len(batch_data) == 0:
+            return {'audio': torch.empty(0)}
+
+        # Collate into batch
+        result = {'audio': torch.stack([item['audio'] for item in batch_data])}
+
+        if 'speaker_id' in batch_data[0]:
+            result['speaker_id'] = torch.stack([
+                batch_data[i]['speaker_id'] for i in range(len(batch_data))
+            ])
+
+        return result
+
+    return collate_fn
+
+
+

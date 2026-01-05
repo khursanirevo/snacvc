@@ -21,7 +21,91 @@ from tqdm import tqdm
 from snac import SNAC
 
 # Import utilities
-from snac.dataset import OptimizedAudioDataset as SimpleAudioDataset, variable_length_collate
+from snac.dataset import OptimizedAudioDataset as SimpleAudioDataset, variable_length_collate, curriculum_collate
+
+
+def get_curriculum_config(epoch, config):
+    """
+    Get segment length and batch size for current epoch based on curriculum.
+
+    Returns:
+        segment_length: Length in seconds for this epoch
+        batch_size: Batch size for this epoch (scaled by segment length)
+    """
+    curriculum = config.get('curriculum', None)
+
+    if curriculum is None:
+        # No curriculum, use fixed values
+        segment_length = config.get('segment_length', 2.0)
+        if isinstance(segment_length, list):
+            segment_length = segment_length[0]  # Use first if list
+        batch_size = config['batch_size']
+        return segment_length, batch_size
+
+    # Curriculum format: {"1": [length, batch_multiplier], "2-3": [length, batch_multiplier], ...}
+    # Or simplified: {"epochs": [1,2], "length": 1.0, "batch_multiplier": 2.0}
+    current_epoch = epoch + 1  # 1-indexed for matching config
+
+    # Check each curriculum entry
+    for entry in curriculum:
+        epochs = entry['epochs']
+        length = entry['length']
+        batch_mult = entry.get('batch_multiplier', 1.0)
+
+        # Parse epoch range
+        if isinstance(epochs, list):
+            if current_epoch >= epochs[0] and current_epoch <= epochs[1]:
+                base_batch = config['batch_size']
+                batch_size = int(base_batch * batch_mult)
+                return length, batch_size
+        else:
+            if current_epoch == epochs:
+                base_batch = config['batch_size']
+                batch_size = int(base_batch * batch_mult)
+                return length, batch_size
+
+    # Default: use last curriculum entry
+    last_entry = curriculum[-1]
+    length = last_entry['length']
+    batch_mult = last_entry.get('batch_multiplier', 1.0)
+    base_batch = config['batch_size']
+    batch_size = int(base_batch * batch_mult)
+    return length, batch_size
+
+
+def create_dataloaders(train_dataset, val_dataset, segment_length, batch_size, num_workers, curriculum_mode=False):
+    """Create dataloaders with appropriate collate function."""
+    if curriculum_mode:
+        # Fixed length per epoch
+        collate_fn = curriculum_collate(train_dataset, segment_length)
+        print(f"  Curriculum mode: {segment_length}s segments, batch_size={batch_size}")
+    elif isinstance(segment_length, list):
+        # Variable length per batch
+        collate_fn = variable_length_collate(train_dataset)
+        print(f"  Variable length mode: {segment_length}s (random per batch), batch_size={batch_size}")
+    else:
+        # Fixed length
+        collate_fn = None
+        print(f"  Fixed length mode: {segment_length}s, batch_size={batch_size}")
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+
+    return train_loader, val_loader
 
 
 def reconstruction_loss(audio, audio_hat, config):
@@ -228,44 +312,41 @@ def main():
 
     # Datasets
     print("\nLoading datasets...")
+    # Determine min segment length for filtering
+    segment_length_config = config.get('segment_length', 2.0)
+    if 'curriculum' in config:
+        # Use minimum length from curriculum for filtering
+        min_length = min(entry['length'] for entry in config['curriculum'])
+    elif isinstance(segment_length_config, list):
+        min_length = min(segment_length_config)
+    else:
+        min_length = segment_length_config
+
     train_dataset = SimpleAudioDataset(
         config['train_data'],
         sampling_rate=24000,
-        segment_length=config.get('segment_length', [1.0, 2.0, 3.0, 4.0]),
+        segment_length=min_length,  # Use min length for filtering
         augment=True,
     )
     val_dataset = SimpleAudioDataset(
         config['val_data'],
         sampling_rate=24000,
-        segment_length=config.get('segment_length', [1.0, 2.0, 3.0, 4.0]),
+        segment_length=min_length,  # Use min length for filtering
         augment=False,
     )
 
-    # Use variable length collate if multiple segment lengths specified
-    segment_length = config.get('segment_length', [1.0, 2.0, 3.0, 4.0])
-    if isinstance(segment_length, list):
-        collate_fn = variable_length_collate(train_dataset)
-        print(f"Using variable segment lengths: {segment_length}s (random per batch)")
-    else:
-        collate_fn = None  # Use default collate
-        print(f"Using fixed segment length: {segment_length}s")
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=config['num_workers'],
-        pin_memory=True,
-        collate_fn=collate_fn,
-    )
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True,
-        collate_fn=collate_fn,
-    )
+    # Check if curriculum mode
+    curriculum_mode = 'curriculum' in config
+    if curriculum_mode:
+        print(f"Curriculum learning enabled:")
+        for entry in config['curriculum']:
+            epochs = entry['epochs']
+            length = entry['length']
+            batch_mult = entry.get('batch_multiplier', 1.0)
+            if isinstance(epochs, list):
+                print(f"  Epochs {epochs[0]}-{epochs[1]}: {length}s, batch_mult={batch_mult}x")
+            else:
+                print(f"  Epoch {epochs}: {length}s, batch_mult={batch_mult}x")
 
     # Resume
     start_epoch = 0
@@ -306,7 +387,41 @@ def main():
     print("Starting training...")
     print("="*70 + "\n")
 
+    # Create initial dataloaders
+    segment_length, batch_size = get_curriculum_config(start_epoch, config)
+    train_loader, val_loader = create_dataloaders(
+        train_dataset, val_dataset, segment_length, batch_size,
+        config['num_workers'], curriculum_mode=curriculum_mode
+    )
+
+    # IMPORTANT: Run validation BEFORE training to establish baseline
+    print("📊 Establishing BASELINE validation metrics (before any training)...")
+    val_metrics_baseline = validate(model, val_loader, device, config)
+    print(f"\n✅ BASELINE (pre-training):")
+    print(f"  Val loss: {val_metrics_baseline['val_loss']:.4f}")
+    print(f"    - L1: {val_metrics_baseline['val_l1']:.4f}")
+    print(f"    - STFT: {val_metrics_baseline['val_stft']:.4f}")
+
+    # Cache baseline
+    baseline_path = output_dir / "baseline_metrics.json"
+    with open(baseline_path, 'w') as f:
+        json.dump(val_metrics_baseline, f, indent=2)
+    print(f"  Cached: {baseline_path}")
+
+    print("\n" + "="*70)
+    print("Starting training...")
+    print("="*70 + "\n")
+
     for epoch in range(start_epoch, config['num_epochs']):
+        # Update dataloaders for curriculum learning
+        if curriculum_mode:
+            segment_length, batch_size = get_curriculum_config(epoch, config)
+            print(f"\n🔄 Creating dataloaders for epoch {epoch+1}:")
+            train_loader, val_loader = create_dataloaders(
+                train_dataset, val_dataset, segment_length, batch_size,
+                config['num_workers'], curriculum_mode=True
+            )
+
         print(f"\nEpoch {epoch+1}/{config['num_epochs']}")
         print(f"Learning rate: {scheduler.get_last_lr()[0]:.2e}")
 
