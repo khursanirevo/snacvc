@@ -75,24 +75,27 @@ def get_curriculum_config(epoch, config):
 
 def create_dataloaders(train_dataset, val_dataset, segment_length, batch_size, num_workers, curriculum_mode=False):
     """Create dataloaders with appropriate collate function."""
+    # Calculate workers: half of batch size, max 8
+    actual_workers = min(batch_size // 2, 8)
+
     if curriculum_mode:
         # Fixed length per epoch
         collate_fn = curriculum_collate(train_dataset, segment_length)
-        print(f"  Curriculum mode: {segment_length}s segments, batch_size={batch_size}")
+        print(f"  Curriculum mode: {segment_length}s segments, batch_size={batch_size}, workers={actual_workers}")
     elif isinstance(segment_length, list):
         # Variable length per batch
         collate_fn = variable_length_collate(train_dataset)
-        print(f"  Variable length mode: {segment_length}s (random per batch), batch_size={batch_size}")
+        print(f"  Variable length mode: {segment_length}s (random per batch), batch_size={batch_size}, workers={actual_workers}")
     else:
         # Fixed length
         collate_fn = None
-        print(f"  Fixed length mode: {segment_length}s, batch_size={batch_size}")
+        print(f"  Fixed length mode: {segment_length}s, batch_size={batch_size}, workers={actual_workers}")
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
+        num_workers=actual_workers,
         pin_memory=True,
         collate_fn=collate_fn,
     )
@@ -100,7 +103,7 @@ def create_dataloaders(train_dataset, val_dataset, segment_length, batch_size, n
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=actual_workers,
         pin_memory=True,
         collate_fn=collate_fn,
     )
@@ -312,9 +315,13 @@ def main():
 
     # Datasets
     print("\nLoading datasets...")
+
+    # Check if curriculum mode (BEFORE creating datasets)
+    curriculum_mode = 'curriculum' in config
+
     # Determine min segment length for filtering
     segment_length_config = config.get('segment_length', 2.0)
-    if 'curriculum' in config:
+    if curriculum_mode:
         # Use minimum length from curriculum for filtering
         min_length = min(entry['length'] for entry in config['curriculum'])
     elif isinstance(segment_length_config, list):
@@ -327,16 +334,15 @@ def main():
         sampling_rate=24000,
         segment_length=min_length,  # Use min length for filtering
         augment=True,
+        curriculum_mode=curriculum_mode,  # Enable idx returns for curriculum
     )
     val_dataset = SimpleAudioDataset(
         config['val_data'],
         sampling_rate=24000,
         segment_length=min_length,  # Use min length for filtering
         augment=False,
+        curriculum_mode=curriculum_mode,  # Enable idx returns for curriculum
     )
-
-    # Check if curriculum mode
-    curriculum_mode = 'curriculum' in config
     if curriculum_mode:
         print(f"Curriculum learning enabled:")
         for entry in config['curriculum']:

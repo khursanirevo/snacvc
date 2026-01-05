@@ -42,6 +42,7 @@ class OptimizedAudioDataset(Dataset):
         seed=42,
         min_length_ratio=1.0,  # Skip files shorter than min(segment_length) * ratio
         filter_short=False,  # Whether to pre-filter short files (SLOW!)
+        curriculum_mode=False,  # Whether using curriculum learning (returns idx for collate)
     ):
         """
         Args:
@@ -56,12 +57,14 @@ class OptimizedAudioDataset(Dataset):
             min_length_ratio: Minimum file length as ratio of min(segment_length)
                              (e.g., 1.0 = skip files shorter than shortest segment)
             filter_short: Whether to pre-filter short files (default: False, much faster)
+            curriculum_mode: If True, return {'idx': idx} for collate function to reload
         """
         self.dataset_root = Path(dataset_root)
         self.sampling_rate = sampling_rate
         self.augment = augment
         self.extract_speaker_ids = extract_speaker_ids
         self.filter_short = filter_short
+        self.curriculum_mode = curriculum_mode
 
         # Handle segment_length as either single value or list
         if isinstance(segment_length, (list, tuple)):
@@ -238,18 +241,18 @@ class OptimizedAudioDataset(Dataset):
 
     def __getitem__(self, idx):
         """
-        Get a sample. Returns index for lazy loading.
+        Get a sample. Returns index for lazy loading when using collate functions.
 
         For backward compatibility with single segment_length,
-        returns loaded audio. For variable lengths, use
-        variable_length_collate which will reload with random length.
+        returns loaded audio. For variable/curriculum modes, returns
+        {'idx': idx} for collate function to handle.
         """
-        # If only one segment length, load directly (efficient)
-        if len(self.segment_lengths) == 1:
-            return self.load_audio(idx, self.segment_lengths[0])
-        else:
-            # Return index for lazy loading by collate function
+        # If curriculum mode OR multiple segment lengths, return idx for lazy loading
+        if self.curriculum_mode or len(self.segment_lengths) > 1:
             return {'idx': idx}
+        else:
+            # Single segment length, load directly (efficient)
+            return self.load_audio(idx, self.segment_lengths[0])
 
 
 # Backward compatibility alias
