@@ -195,6 +195,76 @@ loss_total = (
 )
 ```
 
+### Loss Functions by Metric Type
+
+| Loss Function | Metric Type | Formula | Purpose | Range |
+|--------------|-------------|---------|---------|-------|
+| **Distance-Based Losses** |
+| L1 Loss (MAE) | L1 Distance | `mean(\|x - y\|)` | Time-domain waveform accuracy | [0, ∞) |
+| Multi-Scale STFT | L1 Distance | `mean(\|STFT(x) - STFT(y)\|)` | Spectral accuracy (3 scales) | [0, ∞) |
+| Feature Matching | L1 Distance | `mean(\|f_real - f_fake\|)` | Match intermediate features | [0, ∞) |
+| Codebook Content | L1 Distance | `mean(\|code_orig - code_recon\|)` | Content preservation through codes | [0, ∞) |
+| **Cosine-Based Losses** |
+| Speaker Matching | Cosine Distance | `1 - cosine_sim(emb, target)` | Force output to match target speaker | [0, 2] |
+| **Adversarial Losses** |
+| Hinge Loss (Disc) | ReLU Margin | `mean(relu(1 - D_real)) + mean(relu(1 + D_fake))` | Push real > 1, fake < -1 | [0, ∞) |
+| Generator Adv | Negative Mean | `-mean(D_fake)` | Fool discriminator (push scores > 0) | (-∞, 0] |
+
+**Key Characteristics:**
+
+**Distance-Based Losses (L1/MAE):**
+- Directly measure difference between predicted and target
+- Lower = better
+- Scale-dependent (varies with signal magnitude)
+- Used for: reconstruction, spectral matching, feature alignment
+
+**Cosine-Based Losses:**
+- Measure angular difference between embeddings
+- Scale-invariant (only direction matters)
+- 1 - cosine_sim converts similarity to distance
+- Used for: speaker identity matching (normalized embeddings)
+
+**Adversarial Losses:**
+- Game-theoretic (generator vs discriminator)
+- Hinge: margin-based (push scores apart)
+- Generator: negative mean (wants high discriminator scores)
+- Can go negative (feature of the formulation)
+
+### Training Log Loss Mapping
+
+This table maps the logged loss names to their metric types:
+
+```
+Training Log Output:
+Epoch 0, Batch 182/5351: g_loss=2.8439, d_loss=1.5708, recon=0.6525,
+                          synth=1.0272, vc=0.9224, spk=0.5388,
+                          adv=0.4776, fm=0.2416
+```
+
+| Log Name | Loss Component | Metric Type | Formula |
+|----------|---------------|-------------|---------|
+| `recon` | Reconstruction | **L1 Distance** | L1(waveform) + Multi-Scale STFT |
+| `synth` | Synthetic VC | **L1 Distance** | L1(waveform) + Multi-Scale STFT |
+| `spk` | Speaker Matching | **Cosine Distance** | `1 - cosine_similarity(decoded_emb, target_emb)` |
+| `vc` | Voice Conversion (total) | **Mixed** | 67% L1 + 33% Cosine (weighted by λ) |
+| `adv` | Generator Adversarial | **Negative Mean** | `-mean(D_fake)` |
+| `fm` | Feature Matching | **L1 Distance** | `mean(\|f_real - f_fake\|)` |
+| `d_loss` | Discriminator | **Hinge Loss** | `mean(relu(1 - D_real)) + mean(relu(1 + D_fake))` |
+| `g_loss` | Generator Total | **Composite** | Weighted sum of all above |
+
+**Detailed Breakdown:**
+
+- **`recon`**: Pure L1 distance (MAE) on waveform + L1 on 3 STFT scales
+- **`synth`**: Pure L1 distance (MAE) on waveform + L1 on 3 STFT scales
+- **`spk`**: Pure cosine distance on normalized speaker embeddings
+- **`vc`**: Composite loss:
+  - `λ_recon × L1_reconstruction` (67% with λ_recon=1.0)
+  - `λ_speaker × cosine_speaker_matching` (33% with λ_speaker=0.5)
+- **`adv`**: Negative mean of discriminator scores (can be negative)
+- **`fm`**: L1 distance on discriminator intermediate features
+- **`d_loss`**: Hinge loss with ReLU margin (always ≥ 0)
+- **`g_loss`**: `recon + vc + synth + adv + fm` (weighted combination)
+
 ### 1. Reconstruction Loss (Audio Fidelity)
 
 **Goal**: Reconstruct input audio accurately with speaker conditioning
