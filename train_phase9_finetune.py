@@ -21,7 +21,7 @@ from tqdm import tqdm
 from snac import SNAC
 
 # Import utilities
-from snac.dataset import OptimizedAudioDataset as SimpleAudioDataset
+from snac.dataset import OptimizedAudioDataset as SimpleAudioDataset, variable_length_collate
 
 
 def reconstruction_loss(audio, audio_hat, config):
@@ -231,15 +231,24 @@ def main():
     train_dataset = SimpleAudioDataset(
         config['train_data'],
         sampling_rate=24000,
-        segment_length=config['segment_length'],
+        segment_length=config.get('segment_length', [1.0, 2.0, 3.0, 4.0]),
         augment=True,
     )
     val_dataset = SimpleAudioDataset(
         config['val_data'],
         sampling_rate=24000,
-        segment_length=config['segment_length'],
+        segment_length=config.get('segment_length', [1.0, 2.0, 3.0, 4.0]),
         augment=False,
     )
+
+    # Use variable length collate if multiple segment lengths specified
+    segment_length = config.get('segment_length', [1.0, 2.0, 3.0, 4.0])
+    if isinstance(segment_length, list):
+        collate_fn = variable_length_collate(train_dataset)
+        print(f"Using variable segment lengths: {segment_length}s (random per batch)")
+    else:
+        collate_fn = None  # Use default collate
+        print(f"Using fixed segment length: {segment_length}s")
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -247,6 +256,7 @@ def main():
         shuffle=True,
         num_workers=config['num_workers'],
         pin_memory=True,
+        collate_fn=collate_fn,
     )
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
@@ -254,6 +264,7 @@ def main():
         shuffle=False,
         num_workers=4,
         pin_memory=True,
+        collate_fn=collate_fn,
     )
 
     # Resume

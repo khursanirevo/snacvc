@@ -29,35 +29,46 @@ class OptimizedAudioDataset(Dataset):
     - Skips files that are too short instead of padding
     - Caches resampler to avoid recomputation
     - Sets random seed for reproducible sampling
+    - Supports variable segment lengths (single float or list of floats)
     """
 
     def __init__(
         self,
         dataset_root,
         sampling_rate=24000,
-        segment_length=1.0,  # seconds (changed from 4.0 to match SNAC paper)
+        segment_length=1.0,  # seconds (can be float or list of floats)
         augment=True,
         extract_speaker_ids=False,
         seed=42,
-        min_length_ratio=1.0,  # Skip files shorter than segment_length * ratio
+        min_length_ratio=1.0,  # Skip files shorter than min(segment_length) * ratio
     ):
         """
         Args:
             dataset_root: Path to audio files directory
             sampling_rate: Target sampling rate (default 24kHz for SNAC)
-            segment_length: Length of audio segments in seconds
+            segment_length: Length of audio segments in seconds.
+                           Can be a single float (e.g., 2.0) or list of floats
+                           (e.g., [1.0, 2.0, 3.0, 4.0]) for random length per batch
             augment: Apply gain augmentation
             extract_speaker_ids: Extract speaker IDs from filenames
             seed: Random seed for reproducibility
-            min_length_ratio: Minimum file length as ratio of segment_length
-                             (e.g., 1.0 = skip files shorter than segment_length)
+            min_length_ratio: Minimum file length as ratio of min(segment_length)
+                             (e.g., 1.0 = skip files shorter than shortest segment)
         """
         self.dataset_root = Path(dataset_root)
         self.sampling_rate = sampling_rate
-        self.segment_length = int(segment_length * sampling_rate)
-        self.min_length = int(self.segment_length * min_length_ratio)
         self.augment = augment
         self.extract_speaker_ids = extract_speaker_ids
+
+        # Handle segment_length as either single value or list
+        if isinstance(segment_length, (list, tuple)):
+            self.segment_lengths = segment_length
+            self.min_segment_length = min(segment_length)
+        else:
+            self.segment_lengths = [segment_length]
+            self.min_segment_length = segment_length
+
+        self.min_length = int(self.min_segment_length * sampling_rate * min_length_ratio)
 
         # Set random seed for reproducibility
         random.seed(seed)
@@ -92,7 +103,8 @@ class OptimizedAudioDataset(Dataset):
         valid_samples = []
         skipped = 0
 
-        print(f"Filtering files shorter than {self.min_length / self.sampling_rate:.1f}s...")
+        min_length_sec = self.min_length / self.sampling_rate
+        print(f"Filtering files shorter than {min_length_sec:.1f}s...")
 
         for audio_path in self.samples:
             try:
@@ -111,7 +123,10 @@ class OptimizedAudioDataset(Dataset):
         print(f"  Kept {len(self.samples)} files, skipped {skipped} short files")
 
         if len(self.samples) == 0:
-            raise ValueError(f"No audio files meet minimum length requirement ({self.min_length / self.sampling_rate:.1f}s)")
+            raise ValueError(f"No audio files meet minimum length requirement ({min_length_sec:.1f}s)")
+
+        if len(self.segment_lengths) > 1:
+            print(f"  Variable segment lengths: {self.segment_lengths}s (random per batch)")
 
     def _extract_speaker_ids(self):
         """Extract speaker IDs from filenames."""
@@ -137,8 +152,19 @@ class OptimizedAudioDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx):
+    def load_audio(self, idx, segment_length_sec):
+        """
+        Load audio with a specific segment length.
+
+        Args:
+            idx: Sample index
+            segment_length_sec: Segment length in seconds
+
+        Returns:
+            Dictionary with 'audio' key (and optionally 'speaker_id')
+        """
         audio_path = self.samples[idx]
+        segment_length = int(segment_length_sec * self.sampling_rate)
 
         try:
             # Get audio info WITHOUT loading the full audio
@@ -147,10 +173,10 @@ class OptimizedAudioDataset(Dataset):
             sr = info.sample_rate
 
             # Calculate random start position
-            max_start = total_samples - self.segment_length
+            max_start = total_samples - segment_length
             if max_start < 0:
-                # This shouldn't happen after filtering, but just in case
-                max_start = 0
+                # File too short for this segment length
+                return None
 
             start = torch.randint(0, max_start + 1, (1,)).item()
 
@@ -158,7 +184,7 @@ class OptimizedAudioDataset(Dataset):
             audio, sr = torchaudio.load(
                 str(audio_path),
                 frame_offset=start,
-                num_frames=self.segment_length
+                num_frames=segment_length
             )
 
             # Convert to mono if stereo
@@ -171,11 +197,11 @@ class OptimizedAudioDataset(Dataset):
                 audio = resampler(audio)
 
             # Ensure correct length after resampling
-            if audio.shape[-1] > self.segment_length:
-                audio = audio[..., :self.segment_length]
-            elif audio.shape[-1] < self.segment_length:
-                # Small padding for rounding errors
-                audio = F.pad(audio, (0, self.segment_length - audio.shape[-1]))
+            if audio.shape[-1] > segment_length:
+                audio = audio[..., :segment_length]
+            elif audio.shape[-1] < segment_length:
+                # Small padding for rounding errors only
+                audio = F.pad(audio, (0, segment_length - audio.shape[-1]))
 
             # Augmentation
             if self.augment and torch.rand(1).item() > 0.5:
@@ -199,10 +225,100 @@ class OptimizedAudioDataset(Dataset):
 
         except Exception as e:
             print(f"Error loading {audio_path.name}: {e}")
-            # Return next sample as fallback
-            next_idx = (idx + 1) % len(self.samples)
-            return self.__getitem__(next_idx)
+            return None
+
+    def __getitem__(self, idx):
+        """
+        Get a sample. Returns index for lazy loading.
+
+        For backward compatibility with single segment_length,
+        returns loaded audio. For variable lengths, use
+        variable_length_collate which will reload with random length.
+        """
+        # If only one segment length, load directly (efficient)
+        if len(self.segment_lengths) == 1:
+            return self.load_audio(idx, self.segment_lengths[0])
+        else:
+            # Return index for lazy loading by collate function
+            return {'idx': idx}
 
 
 # Backward compatibility alias
 SimpleAudioDataset = OptimizedAudioDataset
+
+
+def variable_length_collate(dataset):
+    """
+    Custom collate function that randomizes segment length per batch.
+
+    All samples in a batch will have the SAME length (no padding needed),
+    but each batch uses a different randomly chosen length.
+
+    Args:
+        dataset: OptimizedAudioDataset instance
+
+    Returns:
+        Collate function to use with DataLoader
+    """
+    def collate_fn(batch):
+        # Handle both loaded audio (single segment) and indices (variable segments)
+        if batch and 'idx' not in batch[0]:
+            # Single segment length case: already loaded
+            batch = [item for item in batch if item is not None]
+            if len(batch) == 0:
+                return {'audio': torch.empty(0)}
+
+            result = {'audio': torch.stack([item['audio'] for item in batch])}
+            if 'speaker_id' in batch[0]:
+                result['speaker_id'] = torch.stack([item['speaker_id'] for item in batch])
+            return result
+
+        # Variable segment lengths case: reload with random length
+        # Extract indices
+        indices = [item['idx'] for item in batch if item is not None]
+
+        if len(indices) == 0:
+            return {'audio': torch.empty(0)}
+
+        # Randomly choose segment length for this batch
+        segment_length = random.choice(dataset.segment_lengths)
+
+        # Load all samples with this segment length
+        batch_data = []
+        for idx in indices:
+            sample = dataset.load_audio(idx, segment_length)
+            if sample is not None:
+                batch_data.append(sample)
+
+        if len(batch_data) == 0:
+            return {'audio': torch.empty(0)}
+
+        # Collate into batch
+        result = {}
+
+        # Stack audio tensors (all same length, no padding!)
+        try:
+            result['audio'] = torch.stack([item['audio'] for item in batch_data])
+        except RuntimeError as e:
+            # Fallback: pad if lengths somehow differ
+            print(f"Warning: Length mismatch in batch, padding: {e}")
+            max_len = max(item['audio'].shape[0] for item in batch_data)
+            padded_audios = []
+            for item in batch_data:
+                audio = item['audio']
+                if audio.shape[0] < max_len:
+                    audio = F.pad(audio, (0, max_len - audio.shape[0]))
+                padded_audios.append(audio)
+            result['audio'] = torch.stack(padded_audios)
+
+        # Add speaker_id if present
+        if 'speaker_id' in batch_data[0]:
+            result['speaker_id'] = torch.stack([
+                batch_data[i]['speaker_id'] for i in range(len(batch_data))
+            ])
+
+        return result
+
+    return collate_fn
+
+
