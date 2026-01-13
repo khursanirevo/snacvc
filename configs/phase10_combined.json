@@ -1,0 +1,36 @@
+{
+  "experiment_name": "phase10_combined_levantine",
+  "description": "Phase 10: Full fine-tuning on combined Levantine datasets (2.85M files)",
+
+  "pretrained_model": "hubertsiuzdak/snac_24khz",
+
+  "train_data": "/mnt/data/combine/train/audio",
+  "val_data": "/mnt/data/combine/valid/audio",
+  "batch_size": 32,
+  "num_workers": 8,
+
+  "num_epochs": 10,
+  "learning_rate": 15e-6,
+  "weight_decay": 0.0001,
+  "grad_clip": 1.0,
+  "lr_min_ratio": 0.1,
+
+  "save_every_batches": 5000,
+  "output_dir": "checkpoints/phase10_combined_levantine",
+
+  "l1_weight": 1.0,
+  "stft_weight": 1.0,
+  "n_ffts": [1024, 2048, 4096],
+
+  "freeze_encoder": false,
+  "freeze_vq": false,
+
+  "curriculum": [
+    {"epochs": [1, 2], "length": 1.0, "batch_multiplier": 6.0, "comment": "1s segments, 6x batch (192)"},
+    {"epochs": [3, 4], "length": 2.0, "batch_multiplier": 3.0, "comment": "2s segments, 3x batch (96)"},
+    {"epochs": [5, 6], "length": 3.0, "batch_multiplier": 2.0, "comment": "3s segments, 2x batch (64)"},
+    {"epochs": [7, 10], "length": 4.0, "batch_multiplier": 1.5, "comment": "4s segments, 1.5x batch (48)"}
+  ],
+
+  "comment": "Phase 10: Full fine-tuning on 2.85M Levantine audio files with batch-based checkpointing"
+}

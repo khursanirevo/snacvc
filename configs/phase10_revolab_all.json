@@ -1,0 +1,36 @@
+{
+  "experiment_name": "phase10_revolab_all",
+  "description": "Phase 10: Fine-tune on all Revolab combined data with best config",
+
+  "pretrained_model": "hubertsiuzdak/snac_24khz",
+
+  "train_data": "/mnt/data/combine/train/audio",
+  "val_data": "/mnt/data/combine/valid/audio",
+  "batch_size": 48,
+  "eval_batch_size": 64,
+  "num_workers": 8,
+
+  "num_epochs": 10,
+  "learning_rate": 15e-6,
+  "weight_decay": 0.0001,
+  "grad_clip": 1.0,
+  "lr_min_ratio": 0.1,
+  "save_every": 1,
+  "save_every_batches": 5000,
+  "save_every_minutes": 30,
+  "output_dir": "checkpoints/phase10_revolab_all",
+
+  "l1_weight": 1.0,
+  "stft_weight": 1.0,
+  "n_ffts": [1024, 2048, 4096],
+
+  "freeze_encoder": true,
+  "freeze_vq": true,
+
+  "curriculum": [
+    {"epochs": [1, 2], "length": 1.0, "batch_multiplier": 2.0, "comment": "1s segments, batch_size=96 (48×2.0)"},
+    {"epochs": [3, 4], "length": 2.0, "batch_multiplier": 1.0, "comment": "2s segments, batch_size=48 (48×1.0)"},
+    {"epochs": [5, 6], "length": 3.0, "batch_multiplier": 0.6, "comment": "3s segments, batch_size=29 (48×0.6)"},
+    {"epochs": [7, 10], "length": 4.0, "batch_multiplier": 0.45, "comment": "4s segments, batch_size=22 (48×0.45)"}
+  ]
+}
