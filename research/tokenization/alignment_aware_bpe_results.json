@@ -1,0 +1,81 @@
+[
+  {
+    "approach": "Hierarchical BPE (Dedup + 2-gram)",
+    "compression_ratio": 1.1258101515392567,
+    "original_tokens": 2703176,
+    "merged_tokens": 2401094,
+    "tokens_saved": 302082,
+    "merge_operations": 301165,
+    "dedup_savings": 917,
+    "bpe_savings": 301165,
+    "unique_ngrams": 1999978,
+    "repeat_ngrams": 113114,
+    "processing_time": 35627.51749873161
+  },
+  {
+    "approach": "Frame-Boundary 2-gram BPE",
+    "compression_ratio": 1.125547643415746,
+    "original_tokens": 2703176,
+    "merged_tokens": 2401654,
+    "tokens_saved": 301522,
+    "merge_operations": 301522,
+    "unique_ngrams": 2000089,
+    "repeat_ngrams": 113146,
+    "processing_time": 40695.12253689766
+  },
+  {
+    "approach": "Hierarchical BPE (Dedup + 3-gram)",
+    "compression_ratio": 1.0490425538933321,
+    "original_tokens": 2703176,
+    "merged_tokens": 2576803,
+    "tokens_saved": 126373,
+    "merge_operations": 62728,
+    "dedup_savings": 917,
+    "bpe_savings": 125456,
+    "unique_ngrams": 1824653,
+    "repeat_ngrams": 21234,
+    "processing_time": 5950.181471347809
+  },
+  {
+    "approach": "Frame-Boundary 3-gram BPE",
+    "compression_ratio": 1.0488345618733301,
+    "original_tokens": 2703176,
+    "merged_tokens": 2577314,
+    "tokens_saved": 125862,
+    "merge_operations": 62931,
+    "unique_ngrams": 1824874,
+    "repeat_ngrams": 21291,
+    "processing_time": 6017.23580622673
+  },
+  {
+    "approach": "Frame-Boundary 4-gram BPE",
+    "compression_ratio": 1.0287012949451928,
+    "original_tokens": 2703176,
+    "merged_tokens": 2627756,
+    "tokens_saved": 75420,
+    "merge_operations": 25140,
+    "unique_ngrams": 1494041,
+    "repeat_ngrams": 12814,
+    "processing_time": 3261.127622127533
+  },
+  {
+    "approach": "Multi-Frame 2-gram BPE",
+    "compression_ratio": 1.0023282312969313,
+    "original_tokens": 2703176,
+    "merged_tokens": 2696897,
+    "tokens_saved": 6279,
+    "merge_operations": 483,
+    "unique_ngrams": 385769,
+    "repeat_ngrams": 162,
+    "processing_time": 36.402671337127686
+  },
+  {
+    "approach": "Deduplication Only (Baseline)",
+    "compression_ratio": 1.0003393457103853,
+    "original_tokens": 2703176,
+    "merged_tokens": 2702259,
+    "tokens_saved": 917,
+    "merge_operations": 0,
+    "processing_time": 0.04939985275268555
+  }
+]
