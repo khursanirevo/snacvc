@@ -1,81 +1,161 @@
-# SNAC 🍿
+# SNAC Fine-tuning 🍿
 
-Multi-**S**cale **N**eural **A**udio **C**odec (SNAC) compresses audio into discrete codes at a low bitrate. For more information, read the paper: https://arxiv.org/abs/2410.14411
+Multi-**S**cale **N**ural **A**udio **C**odec (SNAC) fine-tuned on Levantine Arabic speech datasets.
 
-| 🎸 Music samples                                                                                         | 🗣️ Speech samples                                                                                       |
-|----------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
-| <video src='https://github.com/hubertsiuzdak/snac/assets/35269911/e8adac68-d3f1-4fc1-8cf9-f48d9bcd95ed'> | <video src='https://github.com/hubertsiuzdak/snac/assets/35269911/65ac2547-c711-49d4-8a5d-64d52e6d6ba1'> |
+## Quick Start
 
-🎧 More audio samples available at https://hubertsiuzdak.github.io/snac/
-
-## Overview
-
-SNAC encodes audio into hierarchical tokens similarly to SoundStream, EnCodec, and DAC (see the image
-on the left). However, SNAC introduces a simple change where coarse tokens are sampled less frequently,
-covering a broader time span (see the image on the right).
-
-This can not only save on bitrate, but more importantly this might be very useful for language modeling approaches to
-audio generation. E.g. with coarse tokens of ~10 Hz and a context window of 2048 you can effectively model a
-consistent structure of an audio track for ~3 minutes.
-
-![snac.png](img%2Fsnac.png)
-
-## Pretrained models
-
-Currently, all models support only single audio channel (mono).
-
-| Model                                                                       | Bitrate   | Sample Rate | Params | Recommended use case     | 
-|-----------------------------------------------------------------------------|-----------|-------------|--------|--------------------------|
-| [hubertsiuzdak/snac_24khz](https://huggingface.co/hubertsiuzdak/snac_24khz) | 0.98 kbps | 24 kHz      | 19.8 M | 🗣️ Speech               | 
-| [hubertsiuzdak/snac_32khz](https://huggingface.co/hubertsiuzdak/snac_32khz) | 1.9 kbps  | 32 kHz      | 54.5 M | 🎸 Music / Sound Effects | 
-| [hubertsiuzdak/snac_44khz](https://huggingface.co/hubertsiuzdak/snac_44khz) | 2.6 kbps  | 44 kHz      | 54.5 M | 🎸 Music / Sound Effects |
-
-## Usage
-
-Install it using:
+### 1. Install dependencies
 
 ```bash
-pip install snac
+# Using uv (recommended)
+uv pip install -e .
+
+# Or using pip
+pip install -e .
 ```
 
-To encode (and decode) audio with SNAC in Python, use the following code:
+### 2. Prepare your dataset
 
-```python
-import torch
-from snac import SNAC
-
-model = SNAC.from_pretrained("hubertsiuzdak/snac_32khz").eval().cuda()
-audio = torch.randn(1, 1, 32000).cuda()  # placeholder for actual audio with shape (B, 1, T)
-
-with torch.inference_mode():
-    codes = model.encode(audio)
-    audio_hat = model.decode(codes)
-```
-
-You can also encode and reconstruct in a single call:
-
-```python
-with torch.inference_mode():
-    audio_hat, codes = model(audio)
-```
-
-⚠️ Note that `codes` is a list of token sequences of variable lengths, each corresponding to a different temporal
-resolution.
+Organize your audio files as follows:
 
 ```
->>> [code.shape[1] for code in codes]
-[12, 24, 48, 96]
+dataset/
+├── train/
+│   ├── file1.wav
+│   ├── file2.wav
+│   └── ...
+└── val/
+    ├── file1.wav
+    ├── file2.wav
+    └── ...
 ```
 
-## Acknowledgements
+Or use the included dataset preparation script:
 
-Module definitions are adapted from the [Descript Audio Codec](https://github.com/descriptinc/descript-audio-codec).
+```bash
+python prepare_dataset_folder.py \
+    --input_dir /path/to/your/audio \
+    --train_ratio 0.95 \
+    --output_dir /path/to/dataset
+```
+
+### 3. Fine-tune SNAC
+
+```bash
+# Single GPU training
+python finetune.py --config configs/phase10_revolab_all.json --device 0
+
+# Multi-GPU training (DDP)
+python finetune.py --config configs/phase10_revolab_all.json --ddp
+```
+
+### 4. Generate audio
+
+```bash
+# Encode/decode audio
+python inference.py \
+    --checkpoint checkpoints/phase10_revolab_all/best_model.pt \
+    --input audio.wav \
+    --output reconstructed.wav
+
+# Generate from codes
+python generate.py \
+    --checkpoint checkpoints/phase10_revolab_all/best_model.pt \
+    --output generated.wav
+```
+
+## Training Configuration
+
+### Curriculum Learning
+
+The training uses curriculum learning with progressively longer audio segments:
+
+| Epochs | Segment Length | Batch Size | Description |
+|--------|---------------|------------|-------------|
+| 1-2 | 1.0s | 96 | Fast iterations, foundation |
+| 3-4 | 2.0s | 48 | Medium context |
+| 5-6 | 3.0s | 28 | Longer context |
+| 7-10 | 4.0s | 21 | Full context, final refinement |
+
+### Configuration Files
+
+- `configs/phase10_revolab_all.json` - Full dataset with curriculum learning
+- `configs/phase10_curriculum.json` - Curriculum learning configuration
+- `configs/phase10_combined.json` - Combined Levantine datasets
+
+Edit config files to adjust:
+- Learning rate
+- Batch size
+- Segment lengths
+- Curriculum schedule
+- Loss weights (L1, STFT)
+
+## Results
+
+**Fine-tuned on 2.8M Levantine Arabic utterances:**
+
+- Baseline val_loss: 0.3119
+- **Best val_loss: 0.2212 (+29.06% improvement)**
+- Final val_loss: 0.2214
+- Training time: ~12 hours (single GPU)
+
+**Checkpoints:**
+- `checkpoints/phase10_revolab_all/best_model.pt` - Best validation model
+- `checkpoints/phase10_revolab_all/checkpoint_epoch*.pt` - Epoch checkpoints
+- `checkpoints/phase10_revolab_all/baseline_metrics.json` - Per-stage baselines
+
+## Architecture
+
+SNAC encodes audio into hierarchical discrete codes:
+
+```
+Audio Input → Encoder → Multi-scale Latent → VQ → Hierarchical Codes
+                                              ↓
+                                         Decoder → Audio Output
+```
+
+**Key Features:**
+- Multi-scale tokenization with different temporal resolutions
+- Coarse tokens sampled less frequently (~10 Hz for 24 kHz audio)
+- Efficient compression at low bitrates (0.98 kbps for speech)
+- Suitable for language modeling approaches to audio generation
+
+## Loss Functions
+
+The model is trained with combined reconstruction loss:
+
+```
+loss = l1_weight * L1_loss + stft_weight * multi_scale_STFT_loss
+```
+
+- **L1 loss**: Time-domain reconstruction error
+- **Multi-scale STFT loss**: Frequency-domain reconstruction at multiple FFT sizes [1024, 2048, 4096]
+
+## Pretrained Models
+
+| Model | Bitrate | Sample Rate | Params | Use Case |
+|-------|---------|-------------|--------|----------|
+| [hubertsiuzdak/snac_24khz](https://huggingface.co/hubertsiuzdak/snac_24khz) | 0.98 kbps | 24 kHz | 19.8M | 🗣️ Speech |
+| [hubertsiuzdak/snac_32khz](https://huggingface.co/hubertsiuzdak/snac_32khz) | 1.9 kbps | 32 kHz | 54.5M | 🎸 Music |
+| [hubertsiuzdak/snac_44khz](https://huggingface.co/hubertsiuzdak/snac_44khz) | 2.6 kbps | 44 kHz | 54.5M | 🎸 Music |
+
+## Requirements
+
+See `requirements.txt` for full dependencies:
+
+```bash
+torch>=2.0.0
+numpy
+einops
+huggingface_hub
+tqdm
+```
 
 ## Citation
 
-If this code contributes to your research, please cite our work:
+If you use SNAC or this fine-tuning code, please cite:
 
-```
+```bibtex
 @inproceedings{siuzdak2024snac,
   title={SNAC: Multi-Scale Neural Audio Codec},
   author={Siuzdak, Hubert and Gr{\"o}tschla, Florian and Lanzend{\"o}rfer, Luca A},
@@ -83,3 +163,12 @@ If this code contributes to your research, please cite our work:
   year={2024}
 }
 ```
+
+## License
+
+See LICENSE file for details.
+
+## Acknowledgements
+
+- Base SNAC implementation by [Hubert Siuzdak](https://github.com/hubertsiuzdak/snac)
+- Module definitions adapted from [Descript Audio Codec](https://github.com/descriptinc/descript-audio-codec)

@@ -111,7 +111,7 @@ class OptimizedAudioDataset(Dataset):
             self._extract_speaker_ids()
 
     def _filter_short_files(self):
-        """Filter out files that are too short using torchaudio.info()."""
+        """Filter out files that are too short."""
         valid_samples = []
         skipped = 0
 
@@ -120,8 +120,10 @@ class OptimizedAudioDataset(Dataset):
 
         for audio_path in self.samples:
             try:
-                info = torchaudio.info(str(audio_path))
-                num_frames = info.num_frames
+                # Load audio to check duration (compatible with all torchaudio versions)
+                waveform, sr = torchaudio.load(str(audio_path))
+                num_frames = waveform.shape[-1]
+                del waveform
 
                 if num_frames >= self.min_length:
                     valid_samples.append(audio_path)
@@ -179,10 +181,14 @@ class OptimizedAudioDataset(Dataset):
         segment_length = int(segment_length_sec * self.sampling_rate)
 
         try:
-            # Get audio info WITHOUT loading the full audio
+            # Get audio duration WITHOUT loading full file (fast!)
             info = torchaudio.info(str(audio_path))
+            original_sr = info.sample_rate
             total_samples = info.num_frames
-            sr = info.sample_rate
+
+            # Adjust total_samples if resampling needed
+            if original_sr != self.sampling_rate:
+                total_samples = int(total_samples * self.sampling_rate / original_sr)
 
             # Calculate random start position
             max_start = total_samples - segment_length
@@ -192,12 +198,26 @@ class OptimizedAudioDataset(Dataset):
 
             start = torch.randint(0, max_start + 1, (1,)).item()
 
+            # Convert start position and segment_length to original sample rate
+            # (frame_offset and num_frames are in the file's native sample rate)
+            if original_sr != self.sampling_rate:
+                frame_offset = int(start * original_sr / self.sampling_rate)
+                num_frames = int(segment_length * original_sr / self.sampling_rate)
+            else:
+                frame_offset = start
+                num_frames = segment_length
+
             # Load ONLY the segment we need! (efficient loading)
             audio, sr = torchaudio.load(
                 str(audio_path),
-                frame_offset=start,
-                num_frames=segment_length
+                frame_offset=frame_offset,
+                num_frames=num_frames
             )
+
+            # Validate loaded audio - check for empty tensors
+            if audio.numel() == 0 or audio.shape[0] == 0 or audio.shape[-1] == 0:
+                # Loaded audio is empty (corrupted file or bad offset)
+                return None
 
             # Convert to mono if stereo
             if audio.shape[0] > 1:

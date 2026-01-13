@@ -2,6 +2,72 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+---
+
+## Current Session
+
+**Date**: 2025-01-13
+
+**No active training jobs** (check with `ps aux | grep -E "(train|finetune)" | grep -v grep`)
+
+---
+
+## Quick Start Guide
+
+### Training (Phase 10: Decoder-Only Fine-tuning)
+
+**REPRODUCIBLE TRAINING SCRIPTS - USE THESE:**
+
+```bash
+# Start training (reproducible, background mode)
+./train_decoder_only.sh 0    # Run on GPU 0
+./train_decoder_only.sh 3    # Run on GPU 3
+
+# Check training status
+./train_status.sh
+
+# Monitor logs
+tail -f logs/phase10_decoder_only/training.log
+```
+
+**Manual training (if scripts don't work):**
+
+```bash
+# Single GPU
+uv run python finetune.py --config configs/phase10_revolab_all.json --device 0
+```
+
+**Full documentation:** `TRAINING_README.md`
+
+### Inference
+
+```bash
+# Encode/decode audio
+uv run python inference.py \
+    --checkpoint checkpoints/phase10_revolab_all/best_model.pt \
+    --input audio.wav \
+    --output reconstructed.wav
+
+# Generate from codes
+uv run python generate.py \
+    --checkpoint checkpoints/phase10_revolab_all/best_model.pt \
+    --output generated.wav
+```
+
+### Tokenization (for BPE analysis)
+
+```bash
+# Convert audio to SNAC tokens
+uv run python research/tokenization/audio_to_tokens.py \
+    --input_dir /mnt/data/combine/train \
+    --output_dir /mnt/data/tokens/train \
+    --checkpoint checkpoints/phase10_revolab_all/best_model.pt \
+    --segment_length 4.0 \
+    --batch_size 200
+```
+
+---
+
 ## Package Management
 
 **IMPORTANT: Always use `uv` for package management and running Python commands.**
@@ -22,49 +88,61 @@ uv pip install -e .
 
 Never use `pip`, `python`, or `python3` directly - always prefix with `uv run` or use `uv pip`.
 
+## Long-Running Tasks (Training)
+
+**IMPORTANT: Use the reproducible training scripts for Phase 10:**
+
+```bash
+./train_decoder_only.sh 0
+```
+
+This script already handles:
+- Background execution with nohup
+- PID file management
+- Log file setup
+- Pre-flight checks
+- Monitoring commands output
+
+**Manual training (only if scripts don't work):**
+
+```bash
+# ALWAYS run in background with nohup
+nohup uv run python finetune.py --config config.json --device 0 > /tmp/training.log 2>&1 &
+TRAIN_PID=$!
+
+# Verify it started
+sleep 3
+ps -p $TRAIN_PID && echo "✓ Running" || echo "✗ Failed"
+
+# Monitor logs
+tail -f /tmp/training.log
+```
+
 ## Project Overview
 
-SNAC (Multi-Scale Neural Audio Codec) is a neural audio codec that compresses audio into discrete codes at low bitrates. The key innovation is hierarchical tokenization where coarse tokens are sampled less frequently, covering broader time spans. This enables efficient audio compression and is particularly useful for language modeling approaches to audio generation.
+SNAC (Multi-Scale Neural Audio Codec) is a neural audio codec that compresses audio into discrete codes at low bitrates. The key innovation is hierarchical tokenization where coarse tokens are sampled less frequently, covering broader time spans.
 
-**Current Focus**: Voice conversion through speaker-conditioned training, with multiple phases exploring different conditioning strategies.
+**Current Phase**: Phase 10 - Simple fine-tuning on Levantine Arabic speech datasets (2.8M utterances). No voice conversion or adapters - just reconstruction quality improvement.
+
+**Previous Phases** (archived):
+- Phase 3-6: Voice conversion experiments with speaker conditioning (contrastive learning, FiLM, adapters)
+- Phase 7-9: Various training strategies (GAN losses, curriculum learning, multi-stage)
+
+**Tokenization Research**: Analyzing SNAC token patterns for BPE compression. See `research/tokenization/TOKENIZER_README.md` for details.
 
 ## Training Phases
 
-The project has evolved through multiple training phases, each exploring different speaker conditioning approaches:
+**Phase 10** (current): Simple fine-tuning on Levantine Arabic
+- Full model training (encoder + decoder)
+- Curriculum learning: 1s → 2s → 3s → 4s segments
+- Loss: L1 + multi-scale STFT
+- Checkpoint: `checkpoints/phase10_revolab_all/best_model.pt`
+- Results: 29% validation loss improvement
 
-- **Phase 3**: Contrastive learning with speaker embeddings
-- **Phase 4**: FiLM conditioning at DECODER (after VQ)
-- **Phase 5**: [Not currently used]
-- **Phase 6**: Adapter conditioning at ENCODER (BEFORE VQ) ← **Current phase**
-
-### Phase 6 Architecture (Recommended)
-
-The key insight is that to get speaker-conditioned codes, the conditioning must happen **before quantization**:
-
-```
-Audio → Encoder → Latent → Adapter(speaker_emb) → Modulated Latent → VQ → Speaker-Conditioned Codes → Decoder
-```
-
-This way:
-- Encoding `audio_A` with `emb_B` produces codes that decode to speaker B
-- The adapter learns to modulate the encoder latent based on target speaker
-- Only ~1M trainable parameters (adapter), base model frozen
-
-### Why Phase 6 over Phase 4?
-
-**Phase 4 (FiLM at Decoder)**:
-```
-Audio → Encoder → Latent → VQ → Codes (speaker-agnostic)
-                                       ↓
-                                 Decoder + FiLM(speaker_emb)
-```
-Problem: Codes already selected, FiLM tries to override speaker info too late
-
-**Phase 6 (Adapter BEFORE VQ)**:
-```
-Audio → Encoder → Latent → Adapter(emb) → Modulated Latent → VQ → Conditioned Codes
-```
-Solution: Adapter shifts latent BEFORE code selection, codes already contain speaker info
+**Archived Phases** (not recommended for new work):
+- Phase 3-6: Voice conversion experiments (speaker conditioning)
+- Phase 4: FiLM conditioning at decoder (after VQ)
+- Phase 6: Adapter conditioning at encoder (before VQ)
 
 ## Installation and Development
 
@@ -93,265 +171,278 @@ The package version is defined in `snac/__init__.py` (currently `__version__ = "
 
 ## Architecture
 
-### Core Components
+### Core SNAC Model (`snac/` directory)
 
-The codebase consists of these main modules in the `snac/` directory:
+**Main Components:**
+- `snac.py` - Main `SNAC` class for audio codec
+- `layers.py` - Encoder and Decoder architectures (SEANet blocks)
+- `vq.py` - Vector quantization (ResidualVectorQuantize)
+- `attention.py` - Local multi-head attention with rotary embeddings
+- `dataset.py` - OptimizedAudioDataset for efficient training
 
-**Base SNAC Model:**
-1. **`snac.py`** - Main `SNAC` class for audio codec
-2. **`layers.py`** - Encoder and Decoder architectures
-3. **`vq.py`** - Vector quantization (VectorQuantize, ResidualVectorQuantize)
-4. **`attention.py`** - Local multi-head attention with rotary embeddings
+**Hierarchical Multi-Scale Processing:**
+- Encoder downsampling strides: `[3, 3, 7, 7]`
+- Decoder upsampling strides: `[7, 7, 3, 3]`
+- 4 codebook levels with temporal strides: `[8, 4, 2, 1]`
+- Residual quantization (each codebook operates on previous residual)
 
-**Speaker Conditioning (Phase 4):**
-5. **`speaker_encoder_factory.py`** - Factory for speaker encoders (ERes2NetV2, ECAPA, Simple)
-6. **`discriminators.py`** - Multi-Period Discriminator (MPD) and Multi-Resolution STFT Discriminator (MRD)
-
-**Speaker Conditioning (Phase 6):**
-7. **`adapters.py`** - AdapterWrapper for conditioning BEFORE VQ
-   - `FiLMAdapter`: Feature-wise Linear Modulation (gamma * latent + beta)
-   - `AdapterWrapper`: Wraps SNAC, applies adapter to encoder latent before quantization
-
-**Training Support:**
-8. **`voice_conversion_loss.py`** - Voice conversion loss with separate identity/VC speaker losses
-9. **`contrastive_loss.py`** - Contrastive learning loss
-10. **`audio_augmentation.py`** - Pitch shifting and formant shifting for synthetic VC
-11. **`faiss_speaker_index.py`** - FAISS-based hard negative mining
-12. **`embedding_cache.py`** - Memory-mapped embedding cache for fast loading
-13. **`stratified_hard_negatives.py`** - Stratified sampling (easy/medium/hard negatives)
-14. **`codebook_adversarial_loss.py`** - Optional codebook purification (not recommended)
-
-### Key Architectural Concepts
-
-**Hierarchical Multi-Scale Processing**: Encoder downsampling `[3, 3, 7, 7]`, decoder upsampling `[7, 7, 3, 3]`.
-
-**Multi-Codebook Quantization**: Multiple codebooks with strides `[8, 4, 2, 1]`, each operating on residual information.
-
-**FiLM (Feature-wise Linear Modulation)**:
-```python
-# Modulates features: gamma(speaker_emb) * features + beta(speaker_emb)
-# In Phase 6, applied BEFORE VQ to shift encoder latent
-z_modulated = gamma * z + beta
+**Data Flow (Phase 10 simple fine-tuning):**
+```
+Audio Input (B, 1, T) → Encoder → Latent (B, 512, T') → VQ → Codes (4 scales) → Decoder → Audio Output
 ```
 
-**AdapterWrapper (Phase 6)**:
-```python
-# Wraps SNAC model
-# Forward: audio → preprocess → encode → adapter(emb) → VQ → decode
-class AdapterWrapper:
-    def forward(self, audio, speaker_embedding=None):
-        z = snac_model.encoder(audio)
-        if speaker_embedding is not None:
-            z = adapter(z, speaker_embedding)  # Modulate BEFORE VQ
-        z_q, codes = snac_model.quantizer(z)
-        audio_hat = snac_model.decoder(z_q)
-        return audio_hat, codes
-```
-
-### Speaker Encoders
-
-**ERes2NetV2** (recommended, from GPT-SoVITS ProPlus):
-- 512-dimensional embeddings
-- Pretrained on speaker verification
-- Frozen during training
-
-Factory pattern in `speaker_encoder_factory.py` supports multiple encoder types.
-
-### Data Flow (Phase 6)
-
-```
-Audio Input (B, 1, T)
-    ↓
-Preprocess (padding)
-    ↓
-Encoder (multi-scale downsampling)
-    ↓
-Latent (B, latent_dim, T')
-    ↓
-Adapter(speaker_emb) → gamma * latent + beta  ← SPEAKER CONDITIONING HERE
-    ↓
-Modulated Latent (B, latent_dim, T')
-    ↓
-ResidualVectorQuantize (hierarchical quantization)
-    ↓
-Speaker-Conditioned Codes (list at different time scales)
-    ↓
-Decoder (multi-scale upsampling)
-    ↓
-Audio Output (B, 1, T)
-```
-
-### Training Scripts
-
-**Phase 4** (FiLM at decoder):
-- `train_phase4_gan.py` - Main training script
-- `train_phase4_gan_ddp.py` - Multi-GPU DDP training
-- `inference_phase4.py` - Test voice conversion quality
-
-**Phase 6** (Adapter BEFORE VQ):
-- `train_phase6_adapters.py` - Main training script (uses `AdapterWrapper`)
-- Config: `configs/phase6_adapters.json`
+**Voice Conditioning Components** (archived, not used in Phase 10):
+- `adapters.py` - FiLM adapters for speaker conditioning
+- `speaker_encoder_factory.py` - Speaker encoders (ERes2NetV2, ECAPA)
+- `discriminators.py` - GAN discriminators (MPD, MRD)
+- `voice_conversion_loss.py` - Speaker identity + VC losses
+- `contrastive_loss.py` - Contrastive learning losses
+- `audio_augmentation.py` - Pitch/formant shifting for synthetic VC
+- `faiss_speaker_index.py` - FAISS-based hard negative mining
+- `embedding_cache.py` - Memory-mapped embedding cache
 
 ### Configuration Files
 
-Training configs use JSON format:
-- `configs/phase4_gan_semantic_negatives.json` - Phase 4 configuration
-- `configs/phase6_adapters.json` - Phase 6 configuration
+**Phase 10** (current):
+- `configs/phase10_revolab_all.json` - Full dataset fine-tuning with curriculum
+- `configs/phase10_curriculum.json` - Curriculum learning configuration
+- `configs/phase10_combined.json` - Combined Levantine datasets
 
-Key config parameters:
+**Key config parameters (Phase 10):**
 ```json
 {
-  "adapter_type": "film",
-  "adapter_hidden_dim": 512,
-  "adapter_num_layers": 2,
-
-  "lambda_speaker_identity": 0.25,  // Lower weight for identity preservation
-  "lambda_speaker_vc": 2.0,          // Higher weight for VC learning
-
-  "use_faiss_hard_negatives": true,
-  "use_synthetic_vc": true,
-  "gan_weight": 1.0
+  "train_data": "/mnt/data/combine/train/audio",
+  "val_data": "/mnt/data/combine/valid/audio",
+  "batch_size": 48,
+  "learning_rate": 15e-6,
+  "l1_weight": 1.0,
+  "stft_weight": 1.0,
+  "n_ffts": [1024, 2048, 4096],
+  "freeze_encoder": true,
+  "freeze_vq": true,
+  "curriculum": [
+    {"epochs": [1, 2], "length": 1.0, "batch_multiplier": 2.0},
+    {"epochs": [3, 4], "length": 2.0, "batch_multiplier": 1.0},
+    {"epochs": [5, 6], "length": 3.0, "batch_multiplier": 0.6},
+    {"epochs": [7, 10], "length": 4.0, "batch_multiplier": 0.45}
+  ]
 }
 ```
 
 ## Loss Functions
 
-### Voice Conversion Loss (Phase 6)
+### Phase 10: Reconstruction Loss
+
+```
+loss = l1_weight * L1_loss + stft_weight * multi_scale_STFT_loss
+```
+
+- **L1 loss**: Time-domain reconstruction error (MAE)
+- **Multi-scale STFT loss**: Frequency-domain reconstruction at FFT sizes `[1024, 2048, 4096]`
+
+This is a simple reconstruction loss - no adversarial, speaker, or feature matching losses.
+
+### Voice Conversion Loss (archived Phase 6)
 
 ```
 vc = lambda_recon * recon + lambda_speaker_identity * spk_id + lambda_speaker_vc * spk_vc
 ```
 
-Where:
-- `recon`: Reconstruction quality (L1 + multi-scale STFT)
-- `spk_id`: Identity speaker loss (encode with own emb, should match)
-- `spk_vc`: Voice conversion speaker loss (encode with target emb, should match target)
-
-At initialization (adapter ≈ identity):
-- `spk_id` ≈ 0.3-0.4 (base model preserves ~60% speaker)
-- `spk_vc` ≈ 0.98 (adapter does nothing, wrong speaker)
-
-Training goal: `spk_vc` decreases to approach `spk_id`.
-
-### Other Losses
-
-- **Adversarial loss** (`lambda_adv = 1.0`): GAN generator loss
-- **Feature matching** (`lambda_fm = 2.0`): Matches intermediate features (highest weight!)
-- **Synthetic VC** (`lambda_synthetic = 0.3`): Pitch-shifted audio with own embedding
+Not used in Phase 10. See archived scripts if needed.
 
 ## Important Training Notes
 
-### Phase 6 Encoding
+### Curriculum Learning (Phase 10)
 
-For Phase 6, ALWAYS encode WITH speaker embedding:
-```python
-# Correct:
-codes = model.encode(audio, speaker_embedding=target_emb)
-audio_out = model.decode(codes)
+Training uses curriculum learning with progressively longer segments:
+| Epochs | Segment | Batch Size | Purpose |
+|--------|---------|------------|---------|
+| 1-2 | 1.0s | 96 | Fast iterations, foundation |
+| 3-4 | 2.0s | 48 | Medium context |
+| 5-6 | 3.0s | 29 | Longer context |
+| 7-10 | 4.0s | 22 | Full context, refinement |
 
-# Wrong (Phase 4 style):
-codes = model.encode(audio)
-audio_out = model.decode(codes, speaker_embedding=target_emb)
-```
+This stabilizes training and improves final quality.
 
-### Speaker Loss Monitoring
+### Freezing Strategy
 
-Watch these metrics during training:
-- `spk_id`: Should stay ~0.3-0.4 (baseline, frozen model limitation)
-- `spk_vc`: Should decrease from 0.98 → 0.4 (adapter learns)
-- `spk_synth`: Pitch shift robustness (should be similar to spk_id)
-- Gap `spk_vc - spk_id`: Should shrink from ~0.6 → <0.1
+In Phase 10 config: `freeze_encoder: true, freeze_vq: true`
+- Only decoder is trained (lightweight, ~15M params)
+- Encoder and VQ remain at pretrained quality
+- Faster training, less overfitting
 
-### Loss Weights Impact
-
-Higher `lambda_speaker_vc` (currently 2.0):
-- Prioritizes learning voice conversion over identity
-- Accelerates `spk_vc` decrease
-- May slightly increase `spk_id` (acceptable trade-off)
-
-## Usage Patterns
-
-### Basic SNAC Usage
-```python
-import torch
-from snac import SNAC
-
-# Load base model
-model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval().cuda()
-
-# Audio shape: (batch, channels, samples)
-audio = torch.randn(1, 1, 24000).cuda()
-
-# Encode
-codes = model.encode(audio)  # List of 4 tensors
-
-# Decode
-audio_hat = model.decode(codes)
-```
-
-### Phase 6: Speaker-Conditioned Encoding
-```python
-from snac import SNACWithSpeakerConditioning
-from snac.adapters import AdapterWrapper
-
-# Load base model
-base_model = SNACWithSpeakerConditioning.from_pretrained_base(
-    "hubertsiuzdak/snac_24khz",
-    speaker_encoder_type="eres2net",
-    freeze_base=True
-).cuda()
-
-# Wrap with adapter
-model = AdapterWrapper(
-    base_model=base_model,
-    adapter_type="film",
-    adapter_hidden_dim=512,
-    adapter_num_layers=2
-).cuda()
-
-# Encode with speaker conditioning
-codes = model.encode(audio, speaker_embedding=target_speaker_emb)
-audio_hat = model.decode(codes)
-
-# Or full forward
-audio_hat, codes = model(audio, speaker_embedding=target_speaker_emb)
-```
-
-### Training Phase 6
-```bash
-# Single GPU
-uv run python train_phase6_adapters.py \
-    --config configs/phase6_adapters.json \
-    --device 3
-
-# Multi-GPU (DDP)
-uv run python train_phase6_adapters.py \
-    --config configs/phase6_adapters.json \
-    --ddp
-```
-
-### Monitoring Training
-```bash
-# Real-time logs
-tail -f logs/phase6/training.log
-
-# Check for speaker loss convergence
-grep "Batch" logs/phase6/training.log | tail -20
-```
+To train full model, set both to `false`.
 
 ## Important Notes
 
 - All models support **mono audio only** (shape: `(B, 1, T)`)
-- `codes` from `encode()` is a **list** of tensors with different temporal resolutions
+- `codes` from `encode()` is a **list** of 4 tensors with different temporal resolutions
 - Audio is automatically padded to ensure proper alignment
-- Phase 6: Only adapter parameters are trainable (~1M), base SNAC frozen (~89M)
-- Speaker encoders are always frozen
-- FAISS index and embedding cache should be pre-built for training (see `scripts/`)
+- Package version in `snac/__init__.py`: currently `1.3.0`
 
 ## Pretrained Models
 
-Available on HuggingFace:
-- `hubertsiuzdak/snac_24khz` - 0.98 kbps, 19.8M params, for speech
+**HuggingFace:**
+- `hubertsiuzdak/snac_24khz` - 0.98 kbps, 19.8M params, speech (24 kHz)
+- `hubertsiuzdak/snac_32khz` - 1.9 kbps, 54.5M params, music (32 kHz)
+- `hubertsiuzdak/snac_44khz` - 2.6 kbps, 54.5M params, music (44 kHz)
 
-Speaker encoder (manual download):
-- ERes2NetV2: Place in `pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt`
+**Fine-tuned (this repo):**
+- `checkpoints/phase10_revolab_all/best_model.pt` - Fine-tuned on Levantine Arabic (29% improvement)
+
+## Dataset Preparation
+
+Organize audio files as:
+```
+dataset/
+├── train/
+│   ├── file1.wav
+│   └── ...
+└── val/
+    ├── file1.wav
+    └── ...
+```
+
+Or use the script:
+```bash
+uv run python prepare_dataset_folder.py \
+    --input_dir /path/to/audio \
+    --train_ratio 0.95 \
+    --output_dir /path/to/dataset
+```
+
+## Repository Structure
+
+```
+/mnt/data/work/snac/
+├── finetune.py                  # Core training script (Phase 10)
+├── inference.py                 # Inference script
+├── generate.py                  # Generation script
+├── prepare_dataset_folder.py    # Dataset preparation
+├── train_decoder_only.sh        # Training launcher (reproducible)
+├── train_status.sh              # Training status checker
+├── TRAINING_README.md           # Training documentation
+├── CLAUDE.md                    # This file
+├── README.md                    # Project README
+├── setup.py                     # Package setup
+├── requirements.txt             # Dependencies
+│
+├── configs/                     # Training configurations
+│   ├── phase10_revolab_all.json  # Main Phase 10 config (decoder-only)
+│   ├── phase10_curriculum.json
+│   └── phase10_combined.json
+│
+├── snac/                        # Main package
+│   ├── snac.py                 # SNAC model
+│   ├── layers.py               # Encoder/Decoder
+│   ├── vq.py                   # Vector quantization
+│   ├── dataset.py              # Dataset classes
+│   └── ... (other modules)
+│
+├── checkpoints/                 # Trained models
+│   └── phase10_revolab_all/
+│       ├── best_model.pt
+│       └── checkpoint_epoch*.pt
+│
+├── logs/                        # Training logs
+│   └── phase10_decoder_only/
+│       └── training.log
+│
+└── research/                    # Research experiments
+    └── tokenization/           # BPE/tokenization research
+        ├── audio_to_tokens.py
+        ├── TOKENIZER_README.md
+        └── BPE.md
+```
+
+## First Thing To Check In Any New Session
+
+```bash
+# Check if any training is still running
+ps aux | grep -E "(finetune|train)" | grep -v grep
+
+# Or use the status script
+./train_status.sh
+
+# Check GPU status
+nvidia-smi
+
+# Check recent logs (if training exists)
+ls -lt logs/*/training.log 2>/dev/null | head -1
+```
+
+## Training Scripts Structure
+
+**Root level scripts (for Phase 10 decoder-only training):**
+- `train_decoder_only.sh` - Main training script (reproducible, background mode)
+- `train_status.sh` - Check running training status
+- `TRAINING_README.md` - Full training documentation
+- `finetune.py` - Core training script (used by train_decoder_only.sh)
+- `inference.py` - Inference script
+- `generate.py` - Generation script
+- `prepare_dataset_folder.py` - Dataset preparation
+
+**To start training:**
+```bash
+./train_decoder_only.sh 0  # GPU 0
+```
+
+**To check status:**
+```bash
+./train_status.sh
+```
+
+**Training outputs:**
+- Checkpoints: `checkpoints/phase10_revolab_all/`
+- Logs: `logs/phase10_decoder_only/training.log`
+- Background logs: `/tmp/phase10_decoder_only_gpu<N>.log`
+- PID files: `/tmp/phase10_decoder_only_gpu<N>.pid`
+
+## Tokenization / BPE Analysis
+
+For analyzing SNAC token patterns and BPE compression potential, see `research/tokenization/TOKENIZER_README.md`.
+
+Quick start:
+```bash
+# Convert audio to tokens
+uv run python research/tokenization/audio_to_tokens.py \
+    --input_dir /mnt/data/combine/train \
+    --output_dir /mnt/data/tokens/train \
+    --checkpoint checkpoints/phase10_revolab_all/best_model.pt \
+    --segment_length 4.0
+
+# Analyze existing tokens
+uv run python research/tokenization/audio_to_tokens.py --analyze_only --output_dir /mnt/data/tokens/train
+```
+
+The script provides:
+- Frequency distribution (Gini coefficient)
+- Bigram patterns
+- Transition sparsity
+- Repetition analysis
+- BPE recommendations
+
+## GPU Access Control Monitor
+
+**Location**: `/mnt/data/work/gpu_access_control/`
+
+Protects GPU 0 by automatically killing processes from users other than `sani`.
+
+**Quick Start**:
+```bash
+cd /mnt/data/work/gpu_access_control
+
+# Test run
+sudo ./manage.sh run
+
+# Install as service (24/7 monitoring)
+sudo ./manage.sh install && sudo ./manage.sh start
+
+# Check status
+sudo ./manage.sh status
+
+# View logs
+sudo ./manage.sh logs
+```
+
+**Configuration**: Edit `monitor.py` to change `ALLOWED_USER` and `GPU_ID`.
