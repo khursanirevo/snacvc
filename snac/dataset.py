@@ -182,9 +182,16 @@ class OptimizedAudioDataset(Dataset):
 
         try:
             # Get audio duration WITHOUT loading full file (fast!)
-            info = torchaudio.info(str(audio_path))
-            original_sr = info.sample_rate
-            total_samples = info.num_frames
+            # torchaudio.info() was removed in newer versions
+            try:
+                import soundfile
+                info = soundfile.info(str(audio_path))
+                original_sr = info.samplerate
+                total_samples = info.frames
+            except (ImportError, Exception):
+                # Fallback: load the full file (slower but works)
+                waveform, original_sr = torchaudio.load(str(audio_path))
+                total_samples = waveform.shape[-1]
 
             # Adjust total_samples if resampling needed
             if original_sr != self.sampling_rate:

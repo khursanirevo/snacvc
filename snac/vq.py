@@ -20,6 +20,7 @@ class VectorQuantize(nn.Module):
         self.codebook = nn.Embedding(codebook_size, codebook_dim)
 
     def forward(self, z):
+        original_len = z.shape[-1]
         if self.stride > 1:
             z = torch.nn.functional.avg_pool1d(z, self.stride, self.stride)
 
@@ -32,6 +33,8 @@ class VectorQuantize(nn.Module):
 
         if self.stride > 1:
             z_q = z_q.repeat_interleave(self.stride, dim=-1)
+            # Trim to match original length (handle non-divisible case)
+            z_q = z_q[..., :original_len]
 
         return z_q, indices
 
@@ -82,8 +85,17 @@ class ResidualVectorQuantize(nn.Module):
         codes = []
         for i, quantizer in enumerate(self.quantizers):
             z_q_i, indices_i = quantizer(residual)
-            z_q = z_q + z_q_i
-            residual = residual - z_q_i
+            # Handle stride non-divisibility: trim both to minimum length
+            if z_q_i.shape[-1] != residual.shape[-1]:
+                min_len = min(z_q_i.shape[-1], residual.shape[-1])
+                z_q_trimmed = z_q_i[..., :min_len]
+                residual_trimmed = residual[..., :min_len]
+            else:
+                z_q_trimmed = z_q_i
+                residual_trimmed = residual
+
+            z_q = z_q + z_q_trimmed
+            residual = residual_trimmed - z_q_trimmed
             codes.append(indices_i)
 
         return z_q, codes
