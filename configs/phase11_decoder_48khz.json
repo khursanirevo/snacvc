@@ -1,0 +1,31 @@
+{
+  "experiment_name": "phase11_decoder_48khz",
+  "description": "Phase 11: Train SNAC decoder to output 48kHz with smart initialization and warmup",
+
+  "pretrained_model": "hubertsiuzdak/snac_24khz",
+
+  "train_data": "/mnt/data/combine/train/audio",
+  "val_data": "/mnt/data/combine/valid/audio",
+  "audio_48khz_train_dir": "/mnt/data/combine/train/audio_48khz",
+  "audio_48khz_val_dir": "/mnt/data/combine/valid/audio_48khz",
+  "batch_size": 32,
+  "eval_batch_size": 48,
+  "num_workers": 0,
+
+  "num_epochs": 15,
+  "warmup_epochs": 3,
+  "learning_rate": 10e-6,
+  "warmup_learning_rate": 5e-5,
+  "weight_decay": 0.0001,
+  "grad_clip": 1.0,
+  "lr_min_ratio": 0.1,
+  "save_every": 1,
+  "output_dir": "checkpoints/phase11_decoder_48khz",
+
+  "segment_length": 4.0,
+  "random_seed": 42,
+
+  "l1_weight": 1.0,
+  "stft_weight": 1.0,
+  "n_ffts": [1024, 2048, 4096, 8192]
+}
