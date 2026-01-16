@@ -4,20 +4,19 @@ Uses cached codes + SIDON on-the-fly for 48kHz targets.
 Based on verified test_cached_codes_training.py
 """
 import os
-import json
 import time
+import signal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader, Dataset
 from pathlib import Path
 import pandas as pd
 import torchaudio
 from tqdm import tqdm
 import numpy as np
-import math
 import random
 
 os.environ['HF_HOME'] = '/mnt/data/work/snac/.hf_cache'
@@ -25,6 +24,11 @@ os.environ['HF_HUB_CACHE'] = '/mnt/data/work/snac/.hf_cache/hub'
 
 from snac import SNAC
 from snac.layers import Decoder, DecoderBlock, Snake1d
+
+
+def calculate_num_workers(batch_size, max_workers=16):
+    """Calculate optimal number of workers based on batch size (Phase 10 formula)."""
+    return min(batch_size // 2, max_workers)
 
 
 class CachedCodesDataset(Dataset):
@@ -111,7 +115,8 @@ class CachedCodesDataset(Dataset):
                 if obj.dtype == object:
                     return torch.tensor(obj.tolist(), dtype=torch.long)
                 else:
-                    return torch.from_numpy(obj).long()
+                    # Copy array to avoid non-writable tensor warning
+                    return torch.from_numpy(obj.copy()).long()
             elif isinstance(obj, list):
                 return torch.tensor(obj, dtype=torch.long)
             else:
@@ -236,19 +241,6 @@ def collate_fn(batch):
     return {'codes': codes_batch, 'audio': audio_batch}
 
 
-def reconstruction_loss(pred, target):
-    """L1 + multi-scale STFT loss."""
-    l1_loss = F.l1_loss(pred, target)
-    stft_loss = 0.0
-    for n_fft in [1024, 2048, 4096]:
-        pred_stft = torch.stft(pred.squeeze(1), n_fft=n_fft, return_complex=True)
-        target_stft = torch.stft(target.squeeze(1), n_fft=n_fft, return_complex=True)
-        stft_loss += F.l1_loss(pred_stft.abs(), target_stft.abs())
-    stft_loss = stft_loss / 3
-    loss = l1_loss + stft_loss
-    return loss, l1_loss, stft_loss
-
-
 class Decoder48kHz(nn.Module):
     """48kHz decoder using pretrained SNAC decoder + 2x upsampler."""
     def __init__(self, pretrained_snac):
@@ -302,7 +294,7 @@ class Decoder48kHz(nn.Module):
         return audio
 
 
-def train_epoch(model, dataloader, pretrained_model, optimizer, device, epoch, scheduler=None, save_checkpoint_fn=None):
+def train_epoch(model, dataloader, pretrained_model, optimizer, device, epoch, scheduler=None, save_checkpoint_fn=None, training_interrupted=None):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -312,6 +304,11 @@ def train_epoch(model, dataloader, pretrained_model, optimizer, device, epoch, s
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     for batch_idx, batch in enumerate(pbar):
+        # Check for interruption flag
+        if training_interrupted is not None and training_interrupted[0]:
+            print("\n⚠ Training interrupted mid-epoch! Breaking training loop...")
+            break
+
         if batch['codes'] is None or batch['audio'].numel() == 0:
             continue
 
@@ -339,6 +336,10 @@ def train_epoch(model, dataloader, pretrained_model, optimizer, device, epoch, s
         optimizer.zero_grad()
         loss, l1_loss, stft_loss = reconstruction_loss(audio_48k_pred, audio_48k_target)
         loss.backward()
+
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         optimizer.step()
 
         # Step scheduler if provided
@@ -356,7 +357,7 @@ def train_epoch(model, dataloader, pretrained_model, optimizer, device, epoch, s
 
         # Checkpoint every 5000 iterations
         if save_checkpoint_fn and (batch_idx + 1) % 5000 == 0:
-            save_checkpoint_fn(epoch, batch_idx + 1, loss.item())
+            save_checkpoint_fn(batch_idx + 1, loss.item())
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0
     avg_l1 = total_l1 / num_batches if num_batches > 0 else 0
@@ -368,6 +369,10 @@ def train_epoch(model, dataloader, pretrained_model, optimizer, device, epoch, s
 def validate(model, dataloader, pretrained_model, device):
     """Validate the model."""
     model.eval()
+
+    # Set fixed seed for consistent validation across runs
+    random.seed(0)
+
     total_loss = 0
     total_l1 = 0
     total_stft = 0
@@ -434,6 +439,7 @@ def main():
     parser.add_argument('--warmup_epochs', type=int, default=3, help='Number of warmup epochs (frozen decoder)')
     parser.add_argument('--main_lr', type=float, default=1e-5, help='Main phase learning rate (unfrozen decoder)')
     parser.add_argument('--segment_schedule', type=str, default='1,2,3,4', help='Segment length schedule (e.g., "1,2,3,4" = 1s epochs 1-3, 2s epochs 4-6, etc.)')
+    parser.add_argument('--batch_multiplier', type=str, default='2.0,1.0,0.6,0.45', help='Batch multipliers for each segment length (e.g., "2.0,1.0,0.6,0.45" = 2x for 1s, 1x for 2s, etc.)')
     parser.add_argument('--cache_dir', type=str, default='/mnt/data/codes_phase11/train', help='Cache directory')
     parser.add_argument('--audio_48k_dir', type=str, default='/mnt/data/combine/train/audio_48khz', help='48kHz audio directory')
     parser.add_argument('--val_cache_dir', type=str, default='/mnt/data/codes_phase11/val', help='Validation cache directory')
@@ -448,8 +454,29 @@ def main():
     device = torch.device(f'cuda:{args.device}')
 
     # Parse segment schedule
+    if not args.segment_schedule or args.segment_schedule.strip() == '':
+        raise ValueError("Segment schedule cannot be empty. Use --segment_schedule '1,2,3,4'")
     segment_schedule = [float(x) for x in args.segment_schedule.split(',')]
+    if len(segment_schedule) == 0:
+        raise ValueError("Segment schedule cannot be empty. Use --segment_schedule '1,2,3,4'")
     print(f"Segment schedule: {segment_schedule}")
+
+    # Parse batch multipliers
+    if not args.batch_multiplier or args.batch_multiplier.strip() == '':
+        raise ValueError("Batch multiplier cannot be empty. Use --batch_multiplier '2.0,1.0,0.6,0.45'")
+    batch_multipliers = [float(x) for x in args.batch_multiplier.split(',')]
+    if len(batch_multipliers) != len(segment_schedule):
+        raise ValueError(f"Batch multiplier count ({len(batch_multipliers)}) must match segment schedule count ({len(segment_schedule)})")
+    print(f"Batch multipliers: {batch_multipliers}")
+    print(f"Dynamic batch sizes: {[int(args.batch_size * m) for m in batch_multipliers]}")
+
+    # Set random seeds for reproducibility
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    print(f"Random seed set to {seed} for reproducibility")
 
     # Determine initial segment length (will be overridden if resuming)
     initial_segment = segment_schedule[0]
@@ -468,6 +495,8 @@ def main():
     log_handle.write(f"Warmup epochs: {args.warmup_epochs}\n")
     log_handle.write(f"Main learning rate: {args.main_lr}\n")
     log_handle.write(f"Segment schedule: {segment_schedule}\n")
+    log_handle.write(f"Batch multipliers: {batch_multipliers}\n")
+    log_handle.write(f"Dynamic batch sizes: {[int(args.batch_size * m) for m in batch_multipliers]}\n")
     log_handle.write(f"Total epochs: {args.epochs}\n")
     log_handle.write(f"Cache dir: {args.cache_dir}\n")
     log_handle.write(f"48kHz audio dir: {args.audio_48k_dir}\n\n")
@@ -476,21 +505,6 @@ def main():
     print("="*70)
     print("PHASE 11: 48kHz DECODER FINE-TUNING (CACHED CODES + 48kHz AUDIO)")
     print("="*70)
-
-    # Load dataset with initial segment length
-    print("\nLoading dataset...")
-    initial_segment = segment_schedule[0]
-    dataset = CachedCodesDataset(args.cache_dir, args.audio_48k_dir, segment_length=initial_segment, limit=args.limit)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                            collate_fn=collate_fn, num_workers=4, persistent_workers=False)
-    print(f"Dataset size: {len(dataset)}")
-
-    # Load validation dataset
-    print("\nLoading validation dataset...")
-    val_dataset = CachedCodesDataset(args.val_cache_dir, args.val_audio_48k_dir, segment_length=initial_segment, limit=args.val_limit)
-    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                                collate_fn=collate_fn, num_workers=4, persistent_workers=False)
-    print(f"Validation dataset size: {len(val_dataset)}")
 
     # Load pretrained SNAC
     print("\nLoading pretrained SNAC...")
@@ -513,11 +527,43 @@ def main():
     start_epoch = 1
     scheduler = None
     current_phase = "WARMUP"
+    resume_epoch = None  # Initialize to avoid undefined variable
 
     # Resume from checkpoint if specified
     if args.resume:
         print(f"\n▶ Resuming from checkpoint: {args.resume}")
         resume_checkpoint = torch.load(args.resume, map_location='cpu')
+
+        # Validate args match checkpoint metadata
+        def validate_arg(name, current_value, checkpoint_value, allow_none=False):
+            if checkpoint_value is None and allow_none:
+                return
+            if checkpoint_value is not None and current_value != checkpoint_value:
+                print(f"  ⚠ Warning: {name} mismatch (current={current_value}, checkpoint={checkpoint_value})")
+                print(f"    Using current value: {current_value}")
+                print(f"    This may affect training reproducibility!")
+
+        # Validate critical args
+        if 'batch_size' in resume_checkpoint:
+            validate_arg('batch_size', args.batch_size, resume_checkpoint['batch_size'])
+        if 'lr' in resume_checkpoint:
+            validate_arg('lr', args.lr, resume_checkpoint['lr'])
+        if 'main_lr' in resume_checkpoint:
+            validate_arg('main_lr', args.main_lr, resume_checkpoint['main_lr'])
+        if 'warmup_epochs' in resume_checkpoint:
+            validate_arg('warmup_epochs', args.warmup_epochs, resume_checkpoint['warmup_epochs'])
+        if 'segment_schedule' in resume_checkpoint:
+            if resume_checkpoint['segment_schedule'] != segment_schedule:
+                print(f"  ⚠ Warning: segment_schedule mismatch")
+                print(f"    Current: {segment_schedule}")
+                print(f"    Checkpoint: {resume_checkpoint['segment_schedule']}")
+                print(f"    Using current schedule (this may affect training!)")
+        if 'batch_multipliers' in resume_checkpoint:
+            if resume_checkpoint['batch_multipliers'] != batch_multipliers:
+                print(f"  ⚠ Warning: batch_multipliers mismatch")
+                print(f"    Current: {batch_multipliers}")
+                print(f"    Checkpoint: {resume_checkpoint['batch_multipliers']}")
+                print(f"    Using current multipliers (this may affect training!)")
 
         # Load model state
         model.load_state_dict(resume_checkpoint['model_state_dict'])
@@ -559,6 +605,15 @@ def main():
         optimizer.load_state_dict(resume_checkpoint['optimizer_state_dict'])
         print("  ✓ Optimizer state restored")
 
+        # Restore random states for reproducible random slicing
+        if 'random_state' in resume_checkpoint:
+            random.setstate(resume_checkpoint['random_state'])
+            torch.set_rng_state(resume_checkpoint['torch_random_state'])
+            np.random.set_state(resume_checkpoint['numpy_random_state'])
+            if resume_checkpoint.get('cuda_random_state') is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state_all(resume_checkpoint['cuda_random_state'])
+            print("  ✓ Random states restored")
+
         start_epoch = resume_epoch + 1  # Continue from next epoch
         print(f"  ✓ Starting from epoch {start_epoch}")
     else:
@@ -575,15 +630,34 @@ def main():
     # Load dataset with correct initial segment length
     print("\nLoading dataset...")
     dataset = CachedCodesDataset(args.cache_dir, args.audio_48k_dir, segment_length=initial_segment, limit=args.limit)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                            collate_fn=collate_fn, num_workers=4, persistent_workers=False)
+
+    # Calculate dynamic workers based on initial batch size (with multiplier)
+    initial_batch_multiplier = batch_multipliers[0]
+    initial_batch_size = int(args.batch_size * initial_batch_multiplier)
+    num_workers = calculate_num_workers(initial_batch_size, max_workers=16)
+
+    print(f"Initial batch size: {args.batch_size} × {initial_batch_multiplier} = {initial_batch_size}")
+    print(f"Workers: {num_workers} (dynamic: min(batch_size//2, 16))")
+
+    dataloader = DataLoader(dataset, batch_size=initial_batch_size, shuffle=True,
+                            collate_fn=collate_fn, num_workers=num_workers, persistent_workers=False)
     print(f"Dataset size: {len(dataset)}")
+
+    # Load validation dataset
+    print("\nLoading validation dataset...")
+    val_dataset = CachedCodesDataset(args.val_cache_dir, args.val_audio_48k_dir, segment_length=initial_segment, limit=args.val_limit)
+    val_dataloader = DataLoader(val_dataset, batch_size=initial_batch_size, shuffle=False,
+                                collate_fn=collate_fn, num_workers=num_workers, persistent_workers=False)
+    print(f"Validation dataset size: {len(val_dataset)}")
 
     # If resuming in MAIN phase, recreate scheduler now that we have dataset size
     if args.resume and resume_epoch > args.warmup_epochs:
         print("\nRecreating OneCycleLR scheduler...")
         batches_per_epoch = len(dataloader)
-        total_steps = (args.epochs - args.warmup_epochs) * batches_per_epoch
+        # CRITICAL: Calculate remaining steps, NOT total steps
+        remaining_epochs = args.epochs - resume_epoch + 1  # +1 because resume_epoch is the last completed epoch
+        total_steps = remaining_epochs * batches_per_epoch
+        print(f"  Remaining epochs: {remaining_epochs}, Total steps: {total_steps}")
         scheduler = OneCycleLR(
             optimizer,
             max_lr=args.main_lr * 10,
@@ -620,6 +694,20 @@ def main():
     best_loss = float('inf')
     last_checkpoint_time = time.time()
 
+    # Global flag for signal handling (use list for pass-by-reference)
+    training_interrupted = [False]
+
+    def signal_handler(signum, frame):
+        """Handle SIGTERM/SIGINT for emergency checkpoint."""
+        training_interrupted[0] = True
+        print(f"\n\n⚠ Received signal {signum}, interrupt flag set...")
+        log_handle.write(f"\n⚠ Received signal {signum}, interrupt flag set...\n")
+        log_handle.flush()
+
+    # Register signal handlers
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
     # Helper function to save intermediate checkpoints
     def save_intermediate_checkpoint(epoch, iteration, loss, phase, checkpoint_type="iter"):
         """Save intermediate checkpoint (5000 iterations or time-based)."""
@@ -631,6 +719,20 @@ def main():
             'loss': loss,
             'phase': phase,
             'warmup_epochs': args.warmup_epochs,
+            # Save metadata for reproducibility
+            'limit': args.limit,
+            'val_limit': args.val_limit,
+            'segment_schedule': segment_schedule,
+            'batch_multipliers': batch_multipliers,
+            'batch_size': args.batch_size,
+            'lr': args.lr,
+            'main_lr': args.main_lr,
+            'epochs': args.epochs,
+            # Save random state for reproducible random slicing
+            'random_state': random.getstate(),
+            'torch_random_state': torch.get_rng_state(),
+            'numpy_random_state': np.random.get_state(),
+            'cuda_random_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }
         if scheduler is not None:
             checkpoint['scheduler_state_dict'] = scheduler.state_dict()
@@ -655,13 +757,23 @@ def main():
             print(f"\n📏 Epoch {epoch}: Increasing segment length to {new_segment_length}s")
             dataset.set_segment_length(new_segment_length)
             val_dataset.set_segment_length(new_segment_length)
-            # Recreate dataloader with new segment length
+
+            # Calculate new batch size based on multiplier
+            batch_multiplier = batch_multipliers[segment_idx]
+            new_batch_size = int(args.batch_size * batch_multiplier)
+            print(f"📦 Batch size: {args.batch_size} × {batch_multiplier} = {new_batch_size}")
+
+            # Calculate dynamic workers for new batch size
+            new_num_workers = calculate_num_workers(new_batch_size, max_workers=16)
+            print(f"👷 Workers: {new_num_workers} (dynamic: min({new_batch_size}//2, 16))")
+
+            # Recreate dataloader with new segment length AND new batch size AND new workers
             # CRITICAL: persistent_workers=False ensures workers restart with new dataset state
-            dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
-                                    collate_fn=collate_fn, num_workers=4, persistent_workers=False)
-            val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
-                                       collate_fn=collate_fn, num_workers=4, persistent_workers=False)
-            log_handle.write(f"Epoch {epoch}: Segment length → {new_segment_length}s\n")
+            dataloader = DataLoader(dataset, batch_size=new_batch_size, shuffle=True,
+                                    collate_fn=collate_fn, num_workers=new_num_workers, persistent_workers=False)
+            val_dataloader = DataLoader(val_dataset, batch_size=new_batch_size, shuffle=False,
+                                       collate_fn=collate_fn, num_workers=new_num_workers, persistent_workers=False)
+            log_handle.write(f"Epoch {epoch}: Segment length → {new_segment_length}s, Batch size → {new_batch_size}, Workers → {new_num_workers}\n")
             log_handle.flush()
 
         # Check if we need to transition to Phase 2
@@ -708,7 +820,46 @@ def main():
             return lambda iteration, loss: save_intermediate_checkpoint(epoch, iteration, loss, phase, "iter")
 
         # Train for one epoch
-        avg_loss, avg_l1, avg_stft = train_epoch(model, dataloader, pretrained_model, optimizer, device, epoch, scheduler, make_checkpoint_fn(epoch, phase))
+        avg_loss, avg_l1, avg_stft = train_epoch(model, dataloader, pretrained_model, optimizer, device, epoch, scheduler, make_checkpoint_fn(epoch, phase), training_interrupted)
+
+        # Check if training was interrupted during the epoch
+        if training_interrupted[0]:
+            print("\n⚠ Training was interrupted during training! Saving emergency checkpoint...")
+            log_handle.write("⚠ Training was interrupted during training! Saving emergency checkpoint...\n")
+            log_handle.flush()
+
+            # Save emergency checkpoint with partial epoch results
+            emergency_checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_loss,
+                'val_loss': None,  # No validation yet
+                'phase': phase,
+                'warmup_epochs': args.warmup_epochs,
+                'limit': args.limit,
+                'val_limit': args.val_limit,
+                'segment_schedule': segment_schedule,
+                'batch_multipliers': batch_multipliers,
+                'batch_size': args.batch_size,
+                'lr': args.lr,
+                'main_lr': args.main_lr,
+                'epochs': args.epochs,
+                'interrupted': True,
+                'random_state': random.getstate(),
+                'torch_random_state': torch.get_rng_state(),
+                'numpy_random_state': np.random.get_state(),
+                'cuda_random_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            }
+            if scheduler is not None:
+                emergency_checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+
+            emergency_filename = output_dir / f'checkpoint_epoch{epoch}_emergency_partial.pt'
+            torch.save(emergency_checkpoint, emergency_filename)
+            print(f"  → Emergency checkpoint saved: {emergency_filename.name}")
+            log_handle.write(f"  → Emergency checkpoint saved: {emergency_filename.name}\n")
+            log_handle.flush()
+            break
 
         # Log with phase indicator and segment length
         log_msg = f"Epoch {epoch} [{phase}, {dataset.segment_length}s]: Loss={avg_loss:.4f}, L1={avg_l1:.4f}, STFT={avg_stft:.4f}"
@@ -733,6 +884,20 @@ def main():
             'val_loss': val_loss,
             'phase': phase,
             'warmup_epochs': args.warmup_epochs,
+            # Save metadata for reproducibility
+            'limit': args.limit,
+            'val_limit': args.val_limit,
+            'segment_schedule': segment_schedule,
+            'batch_multipliers': batch_multipliers,
+            'batch_size': args.batch_size,
+            'lr': args.lr,
+            'main_lr': args.main_lr,
+            'epochs': args.epochs,
+            # Save random state for reproducible random slicing
+            'random_state': random.getstate(),
+            'torch_random_state': torch.get_rng_state(),
+            'numpy_random_state': np.random.get_state(),
+            'cuda_random_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }
 
         # Save scheduler state if available
@@ -755,8 +920,52 @@ def main():
             save_intermediate_checkpoint(epoch, 0, avg_loss, phase, "time")
             last_checkpoint_time = time.time()
 
+        # Check if training was interrupted
+        if training_interrupted[0]:
+            print("\n⚠ Training interrupted! Saving emergency checkpoint...")
+            log_handle.write("⚠ Training interrupted! Saving emergency checkpoint...\n")
+            log_handle.flush()
+
+            # Save emergency checkpoint
+            emergency_checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_loss,
+                'val_loss': val_loss,
+                'phase': phase,
+                'warmup_epochs': args.warmup_epochs,
+                # Save metadata for reproducibility
+                'limit': args.limit,
+                'val_limit': args.val_limit,
+                'segment_schedule': segment_schedule,
+                'batch_multipliers': batch_multipliers,
+                'batch_size': args.batch_size,
+                'lr': args.lr,
+                'main_lr': args.main_lr,
+                'epochs': args.epochs,
+                'interrupted': True,
+                # Save random state for reproducible random slicing
+                'random_state': random.getstate(),
+                'torch_random_state': torch.get_rng_state(),
+                'numpy_random_state': np.random.get_state(),
+                'cuda_random_state': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            }
+            if scheduler is not None:
+                emergency_checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+
+            emergency_filename = output_dir / f'checkpoint_epoch{epoch}_emergency.pt'
+            torch.save(emergency_checkpoint, emergency_filename)
+            print(f"  → Emergency checkpoint saved: {emergency_filename.name}")
+            log_handle.write(f"  → Emergency checkpoint saved: {emergency_filename.name}\n")
+            log_handle.flush()
+            break
+
     print("\n" + "="*70)
-    print("TRAINING COMPLETE")
+    if training_interrupted[0]:
+        print("TRAINING INTERRUPTED (Emergency checkpoint saved)")
+    else:
+        print("TRAINING COMPLETE")
     print("="*70)
     print(f"Best loss: {best_loss:.4f}")
     print(f"Checkpoints saved to: {output_dir}")
