@@ -6,24 +6,40 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current Session
 
-**Date**: 2026-01-15
+**Date**: 2026-01-16
 
-**Phase 11 active**: 48kHz decoder with random slicing + validation + checkpointing
+**Phase 12 active**: Dual-head decoder (24kHz + 48kHz outputs)
 
-**Status**: Testing on 50k rows with full validation and checkpointing. Ready for full-scale training.
+**Status**: 🚀 **Training running** on GPU 3
 
-**Caching complete**:
-- ✅ Training: 2.8M files in `/mnt/data/codes_phase11/train/`
-- ✅ Validation: 55,419 files in `/mnt/data/codes_phase11/val/`
+**Training details**:
+- **Location**: `checkpoints/phase12_dual_head/`
+- **Logs**: `/tmp/phase12_dual_head_gpu3.log`
+- **Dataset**: 3,447,109 training + 55,419 validation samples
+- **Architecture**: Shared decoder → 24kHz head + 48kHz head
+- **Strategy**: Warmup (epoch 1, 48kHz only) → Main (epochs 2-15, both heads)
+- **VRAM**: 112GB / 144GB (GPU 3) - higher in main phase
+- **Current Epoch**: 4/15 (resumed from checkpoint)
 
-**Recent features added**:
-- ✅ Checkpoint resumption with `--resume` flag
-- ✅ Shape mismatch bug in random slicing (padding shorter tensors)
-- ✅ `--limit` option for testing on small datasets
-- ✅ **Validation function** with full validation dataset
-- ✅ **Checkpoint every 5000 iterations**
-- ✅ **Time-based checkpointing** (every 30 min)
-- ✅ Best model based on validation loss
+**Key Phase 12 features**:
+- ✅ Dual-head decoder: 24kHz (pretrained SNAC) + 48kHz (new)
+- ✅ Fair comparison with Phase 10 (same 24kHz metrics)
+- ✅ Using pretrained SNAC decoder (matches pretrained SNAC encoder)
+- ✅ Smart weight initialization from pretrained SNAC block 5
+- ✅ Higher LRs (2x faster): warmup 2e-4, main 5e-5, 24kHz 1e-5
+- ✅ Phase 10 style epoch ranges: 1-2, 3-4, 5-6, 7-15
+- ✅ Weighted loss: 0.3 × 24kHz + 1.0 × 48kHz
+- ✅ Checkpoint resumption support
+
+**Recent fixes**:
+- ✅ Fixed checkpoint saving bug (None optimizer handling)
+- ✅ Added epoch_ranges parameter for curriculum learning
+- ✅ Increased learning rates for faster training
+
+**Phase 11 completed**:
+- ✅ 48kHz decoder training with random slicing
+- ✅ Cached codes: 3.4M training + 55k validation samples
+- ✅ Checkpoint resumption, validation, time-based checkpointing
 
 ---
 
@@ -62,9 +78,60 @@ When unsure about the approach:
 
 ## Quick Start Guide
 
-### Training (Phase 11: 48kHz Decoder - ⭐ CURRENT)
+### Training (Phase 12: Dual-Head Decoder - ⭐ CURRENT)
 
-**CURRENT APPROACH: Cached codes + random slicing + Phase 10 base checkpoint**
+**CURRENT APPROACH: Dual-head decoder (24kHz + 48kHz) with pretrained SNAC decoder**
+
+```bash
+# Start Phase 12 training
+./train_dual_head_48khz.sh 0    # GPU 0
+./train_dual_head_48khz.sh 3    # GPU 3
+
+# Monitor logs
+tail -f /tmp/phase12_dual_head_gpu3.log
+
+# Manual training
+uv run python finetune_dual_head_48khz_cached.py \
+    --device 0 \
+    --batch_size 96 \
+    --epochs 15 \
+    --warmup_epochs 1 \
+    --lr 2e-4 \
+    --main_lr 5e-5 \
+    --lr_24k_final_conv 1e-5 \
+    --segment_schedule "1.0,2.0,3.0,4.0" \
+    --batch_multiplier "2.0,1.0,0.6,0.45" \
+    --epoch_ranges "1-2,3-4,5-6,7-15" \
+    --output_dir checkpoints/phase12_dual_head
+
+# Resume from checkpoint
+uv run python finetune_dual_head_48khz_cached.py \
+    --device 3 \
+    --resume checkpoints/phase12_dual_head/checkpoint_epoch3.pt \
+    --output_dir checkpoints/phase12_dual_head
+```
+
+**Architecture**: Shared decoder → 24kHz final conv + 48kHz upsampler + final conv
+
+**Training phases**:
+- **Warmup (epoch 1)**: Only 48kHz trains, decoder frozen, LR=2e-4
+- **Main (epochs 2-15)**: Both train, decoder unfrozen
+  - Shared decoder + 48kHz: LR=5e-5
+  - 24kHz final conv: LR=1e-5 (5× smaller)
+
+**Curriculum (Phase 10 style)**:
+- Epochs 1-2: 1.0s segments, batch=192
+- Epochs 3-4: 2.0s segments, batch=96
+- Epochs 5-6: 3.0s segments, batch=57
+- Epochs 7-15: 4.0s segments, batch=43
+
+**Documentation**: `PHASE12_README.md`
+
+---
+
+### Training (Phase 11: 48kHz Decoder - ✅ COMPLETED)
+
+**APPROACH: Cached codes + random slicing + Phase 10 base checkpoint**
 
 ```bash
 # Test training on 5k rows (for debugging)
@@ -209,7 +276,8 @@ tail -f /tmp/training.log
 SNAC (Multi-Scale Neural Audio Codec) is a neural audio codec that compresses audio into discrete codes at low bitrates. The key innovation is hierarchical tokenization where coarse tokens are sampled less frequently, covering broader time spans.
 
 **Current Phases**:
-- **Phase 11** (active): 48kHz decoder output with smart initialization
+- **Phase 12** (active): Dual-head decoder (24kHz + 48kHz outputs)
+- **Phase 11** (completed): 48kHz decoder output with random slicing
 - **Phase 10** (completed): Simple fine-tuning on Levantine Arabic speech datasets (2.8M utterances)
 
 ## Training Phases
@@ -221,20 +289,33 @@ SNAC (Multi-Scale Neural Audio Codec) is a neural audio codec that compresses au
 - Checkpoint: `checkpoints/phase10_revolab_all/best_model.pt`
 - Results: 29% validation loss improvement
 
-**Phase 11** (current): 48kHz decoder output with random slicing + smart initialization
+**Phase 11** (completed): 48kHz decoder output with random slicing
 - **Goal**: Modify SNAC decoder to output 48kHz audio (instead of 24kHz)
 - **Strategy**: Random segment slicing + smart weight initialization + two-phase training
 - **Architecture**: Phase 10 decoder → NEW 2x upsampler → Final conv → 48kHz
 - **Random Slicing**: Each sample uses random start position (dynamic curriculum learning)
 - **Critical Alignment**: Multi-scale formula ensures codes + audio extract from SAME temporal position
-- **Phase 1 (Warmup, epoch 1)**: Train only upsampler + final conv (LR: 5e-5)
-- **Phase 2 (Main, epochs 2-15)**: Unfreeze entire decoder (LR: 1e-5 with OneCycleLR)
-- Uses pre-generated 48kHz audio (no SIDON during training)
 - **Checkpoint Resumption**: `--resume` flag restores model, optimizer, scheduler, epoch, phase, segment length
-- **CURRENT APPROACH**: Cached codes + random slicing + Phase 10 base checkpoint
-- Scripts: `finetune_decoder_48khz_simple_cached.py` (⭐ current), `cache_codes_multigpu.py`
-- Configs: `configs/phase11_decoder_48khz.json`
-- Docs: `PHASE11_OPTIONS.md`, `PHASE11_README.md`, `TODO.md`
+- Scripts: `finetune_decoder_48khz_simple_cached.py`, `cache_codes_multigpu.py`
+- Docs: `PHASE11_OPTIONS.md`, `PHASE11_README.md`
+
+**Phase 12** (current): Dual-head decoder (24kHz + 48kHz outputs)
+- **Goal**: Train dual-head decoder for fair comparison with Phase 10
+- **Architecture**: Shared decoder → 24kHz final conv + 48kHz upsampler → final conv
+- **Decoder**: Uses pretrained SNAC decoder (matches pretrained SNAC encoder)
+- **Strategy**:
+  - Warmup (epoch 1): Train only 48kHz upsampler (decoder frozen, LR: 2e-4)
+  - Main (epochs 2-15): Train both heads (decoder unfrozen, 24kHz LR: 1e-5, 48kHz LR: 5e-5)
+- **Curriculum**: Phase 10 style epoch ranges (1-2: 1.0s, 3-4: 2.0s, 5-6: 3.0s, 7-15: 4.0s)
+- **Loss weights**: 0.3 × 24kHz + 1.0 × 48kHz
+- **Fair comparison**: 24kHz head uses pretrained SNAC (same as Phase 10 baseline)
+- **Smart initialization**:
+  - 24kHz head: From pretrained SNAC final conv
+  - 48kHz upsampler: From pretrained block 5 (first 64 channels)
+- **Higher LRs**: 2x faster than original (warmup 2e-4, main 5e-5)
+- **Checkpoint resumption**: Full support with `--resume` flag
+- Scripts: `finetune_dual_head_48khz_cached.py`, `train_dual_head_48khz.sh`
+- Docs: `PHASE12_README.md`
 
 ## Installation and Development
 
@@ -620,11 +701,10 @@ ls -lh /mnt/data/codes_phase11/train/*.parquet 2>/dev/null | wc -l
 
 **Root level scripts:**
 
-**Phase 10 (24kHz decoder):**
-- `train_decoder_only.sh` - Main training script (reproducible, background mode)
-- `train_status.sh` - Check running training status
-- `TRAINING_README.md` - Full training documentation
-- `finetune.py` - Core training script (used by train_decoder_only.sh)
+**Phase 12 (Dual-head decoder):**
+- `train_dual_head_48khz.sh` - ⭐ CURRENT: Dual-head training script
+- `finetune_dual_head_48khz_cached.py` - Dual-head training with cached codes
+- `PHASE12_README.md` - Full Phase 12 documentation
 
 **Phase 11 (48kHz decoder):**
 - `train_decoder_48khz_warmup.sh` - ⭐ Smart init + warmup (RECOMMENDED)
@@ -634,25 +714,36 @@ ls -lh /mnt/data/codes_phase11/train/*.parquet 2>/dev/null | wc -l
 - `PHASE11_README.md` - Full Phase 11 documentation
 - `finetune_decoder_48khz_warmup.py` - Smart initialization training
 - `finetune_decoder_48khz_fast.py` - Fast training with pre-computed codes
-- `finetune_decoder_48khz_simple_cached.py` - ⭐ CURRENT: Cached codes + Phase 10 init + OneCycleLR + segment schedule
+- `finetune_decoder_48khz_simple_cached.py` - Cached codes + Phase 10 init + OneCycleLR + segment schedule
 - `cache_codes_multigpu.py` - Multi-GPU caching script (uses all 4 GPUs)
 - `cache_codes_full.py` - Single-GPU caching (slow, deprecated)
 - `cache_codes_full_batched.py` - Single-GPU batched caching (deprecated)
 - `precompute_codes.py` - Pre-compute quantized codes (deprecated)
+
+**Phase 10 (24kHz decoder):**
+- `train_decoder_only.sh` - Main training script (reproducible, background mode)
+- `train_status.sh` - Check running training status
+- `TRAINING_README.md` - Full training documentation
+- `finetune.py` - Core training script (used by train_decoder_only.sh)
 
 **Common scripts:**
 - `inference.py` - Inference script
 - `generate.py` - Generation script
 - `prepare_dataset_folder.py` - Dataset preparation
 
+**To start Phase 12 training:**
+```bash
+./train_dual_head_48khz.sh 0  # GPU 0
+```
+
+**To start Phase 11 training:**
+```bash
+./train_decoder_48khz_warmup.sh 0  # GPU 0
+```
+
 **To start Phase 10 training:**
 ```bash
 ./train_decoder_only.sh 0  # GPU 0
-```
-
-**To start Phase 11 training (recommended):**
-```bash
-./train_decoder_48khz_warmup.sh 0  # GPU 0
 ```
 
 **To check status:**
@@ -661,8 +752,9 @@ ls -lh /mnt/data/codes_phase11/train/*.parquet 2>/dev/null | wc -l
 ```
 
 **Training outputs:**
+- Phase 12: `checkpoints/phase12_dual_head/`, `/tmp/phase12_dual_head_gpu<N>.log`
+- Phase 11: `checkpoints/phase11_decoder_48khz/`, `/tmp/phase11_partial_gpu<N>.log`
 - Phase 10: `checkpoints/phase10_revolab_all/`, `logs/phase10_decoder_only/training.log`
-- Phase 11: `checkpoints/phase11_decoder_48khz/`, `logs/phase11_decoder_48khz/training.log`
 - Background logs: `/tmp/phase*_gpu<N>.log`
 - PID files: `/tmp/phase*_gpu<N>.pid`
 

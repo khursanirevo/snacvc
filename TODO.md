@@ -1,72 +1,145 @@
-# Phase 11 Training TODO - Random Segment Slicing
+# Phase 12 Training TODO - Dual-Head Decoder (24kHz + 48kHz)
+
+## Goal
+Train **dual-head decoder** that outputs **both 24kHz and 48kHz audio** from the same shared encoder+VQ backbone.
+
+## Key Innovation
+Unlike Phase 11 (48kHz-only), Phase 12 maintains the 24kHz output head from pretrained SNAC, enabling:
+1. **Direct comparison**: 24kHz loss vs Phase 10's 24kHz loss (same metrics!)
+2. **Pretrained baseline**: 24kHz head uses pretrained SNAC (same as Phase 10 baseline)
+3. **Multi-resolution output**: Generate either 24kHz or 48kHz as needed
+4. **Better training**: 24kHz loss stabilizes shared decoder for 48kHz learning
+
+## Current Status
+
+**🚀 TRAINING RUNNING ON GPU 3**
+
+### Training Progress:
+- **Current**: Epoch 4/15, resumed from checkpoint (epoch 3, batch 60476)
+- **Location**: `checkpoints/phase12_dual_head/`
+- **Logs**: `/tmp/phase12_dual_head_gpu3.log`
+- **Dataset**: 3,447,109 training + 55,419 validation samples
+- **VRAM**: 112GB / 144GB (GPU 3) - higher in main phase
+- **Segment**: 2.0s (epochs 3-4)
+
+### Recent Improvements (Jan 16, 2026):
+- ✅ **Increased LRs** (2x faster): warmup 2e-4, main 5e-5, 24kHz 1e-5
+- ✅ **Phase 10 style curriculum**: Epoch ranges (1-2: 1.0s, 3-4: 2.0s, 5-6: 3.0s, 7-15: 4.0s)
+- ✅ **Checkpoint saving bug fix**: Handle None optimizer in warmup
+- ✅ **Checkpoint resumption**: Full support with `--resume` flag
+- ✅ **File organization**: Deprecated scripts moved to `archive/`
+
+### Architecture
+```
+Shared Decoder (blocks 0-5) → 64ch @ 24kHz
+                                ├→ 24kHz Final Conv → 24kHz output (pretrained SNAC)
+                                └→ 2x Upsampler → 48kHz Final Conv → 48kHz output (new)
+```
+
+### Implemented Features:
+- **✅ Dual-head decoder** - `DualHeadDecoder` class
+  - Shared decoder (blocks 0-5) from pretrained SNAC (matches pretrained encoder)
+  - 24kHz head: Single Conv1d (64 → 1), initializes from pretrained SNAC
+  - 48kHz head: Snake1d → DecoderBlock(stride=2) → Conv1d (64 → 1)
+
+- **✅ Smart weight initialization**
+  - 24kHz head: From pretrained SNAC final conv
+  - 48kHz upsampler: From pretrained block 5 (first 64 channels)
+
+- **✅ Two-phase training with different LRs**
+  - Warmup (epoch 1): Only 48kHz trains, decoder frozen, LR: 2e-4 (INCREASED)
+  - Main (epochs 2-15): Both train, 24kHz LR: 1e-5, 48kHz LR: 5e-5 (INCREASED)
+
+- **✅ Phase 10 style curriculum**
+  - Epochs 1-2: 1.0s segments, batch=192
+  - Epochs 3-4: 2.0s segments, batch=96
+  - Epochs 5-6: 3.0s segments, batch=57
+  - Epochs 7-15: 4.0s segments, batch=43
+
+- **✅ Weighted dual loss**
+  - Loss weights: 0.3 × 24kHz + 1.0 × 48kHz
+  - 24kHz for monitoring in warmup, for training in main phase
+
+- **✅ Checkpoint resumption**
+  - Restores model, optimizer, scheduler, epoch, phase, segment length
+  - Use `--resume checkpoints/phase12_dual_head/checkpoint_epoch3.pt`
+
+### Implementation Tasks:
+- [x] Create `DualHeadDecoder` class with two output heads
+- [x] Load pretrained SNAC weights for 24kHz head
+- [x] Implement smart weight initialization for 48kHz upsampler
+- [x] Add two-phase training with different LRs per component
+- [x] Implement weighted dual loss (24kHz + 48kHz)
+- [x] Fix device placement for pretrained SNAC model
+- [x] Add epoch_ranges parameter for Phase 10 style curriculum
+- [x] Increase learning rates for faster training (2x)
+- [x] Fix checkpoint saving bug (None optimizer handling)
+- [x] Implement checkpoint resumption with full state restore
+- [x] Start training on GPU 3
+- [x] Resume from checkpoint epoch 3
+
+### File Organization:
+- **Root**: Core training scripts (finetune_dual_head_48khz_cached.py, finetune.py, etc.)
+- **archive/**: Deprecated Phase 11 variants, old shell scripts
+- **scripts/**: Precompute, caching, utility scripts
+- **tests/**: Test scripts for cached codes, random slicing
+
+---
+
+# Phase 11 Training (COMPLETED ✅)
 
 ## Goal
 Train 48kHz decoder with **random segment slicing** during training (dynamic curriculum learning)
 
-## Current Status
+## Status: COMPLETED
+- **Location**: `checkpoints/phase11_decoder_48khz_full/`
+- **Dataset**: 3.4M training + 55k validation samples (cached)
+- **Features**: Validation, checkpointing, time-based checkpoints, best model saving
 
-**🎉 TESTING IN PROGRESS: 50k rows with validation + advanced checkpointing**
+### Key Features Implemented:
+- ✅ Random slicing with critical multi-scale alignment
+- ✅ Smart weight initialization from pretrained SNAC
+- ✅ Checkpoint resumption with `--resume` flag
+- ✅ Validation function with 55,419 samples
+- ✅ Advanced checkpointing (every 5000 iterations, every 30 min)
+- ✅ Shape mismatch bug fix (padding shorter tensors)
+- ✅ Testing mode with `--limit` option
 
-### Training Progress:
-- **Current**: Testing on 50k rows with full features
-- **Location**: `checkpoints/phase11_decoder_48khz_test/`
-- **Logs**: `logs/phase11_decoder_48khz_test/training.log`
-- **Features**: Validation, 5k-iteration checkpoints, time-based checkpointing
+---
 
-### Caching (COMPLETE ✅):
-- **Training**: 2.8M files → 2857 parquet files in `/mnt/data/codes_phase11/train/`
-- **Validation**: 55,419 files → 56 parquet files in `/mnt/data/codes_phase11/val/`
-- **Status**: Complete! Ready for full-scale training
 
-### Implemented Features:
-- **✅ Checkpoint Resumption** - `--resume` flag
-  - Restores model, optimizer, scheduler state
-  - Automatically determines segment length from resumed epoch
-  - Restores frozen/unfrozen decoder state based on phase
 
-- **✅ Smart Weight Initialization** - Implemented in `finetune_decoder_48khz_simple_cached.py`
-  - Fastai technique: Average pretrained weights (128→64 channels)
-  - Source: Pretrained decoder `blocks[5]` (2x upsampler)
-  - Better convergence than random initialization
+## Known Issues (Non-Critical)
 
-- **✅ Random Slicing with Critical Alignment** - Implemented in `CachedCodesDataset`
-  - Random start position calculation for each sample
-  - Multi-scale alignment formula: `scale_start = start_pos * (vq_strides[0] // vq_strides[scale])`
-  - Audio slicing aligned with same random position
-  - **BUG FIX**: Padding shorter tensors to prevent shape mismatch in batches
+### Code Quality Issues
+**These issues don't affect training but could be improved:**
 
-- **✅ Validation Function** - Complete with 55,419 validation samples
-  - Runs after each epoch
-  - Computes L1 + STFT loss on validation set
-  - Best model saved based on validation loss
+1. **Duplicate `reconstruction_loss` function** (lines 239 and 414)
+   - Function defined twice, second definition overwrites first
+   - Impact: Code maintenance issue, no runtime effect
+   - Fix: Remove first definition (lines 239-249)
 
-- **✅ Advanced Checkpointing**:
-  - Checkpoint every 5000 iterations: `checkpoint_epoch{N}_iter{M}.pt`
-  - Time-based checkpointing every 30 min: `checkpoint_epoch{N}_time_{timestamp}.pt`
-  - End-of-epoch checkpoints: `checkpoint_epoch{N}.pt`
-  - Best model: `best_model.pt` (based on validation loss)
+2. **Dataset loaded twice at startup** (lines 481-486 and 575-580)
+   - Same dataset created twice before and after resume logic
+   - Impact: ~30-60 seconds wasted at startup
+   - Fix: Move first dataset loading after resume logic
 
-- **✅ Testing Mode** - `--limit` option
-  - Test training on small subset (e.g., 50000 rows)
-  - Verify bug fixes before committing to full-scale training
+3. **No mixed precision training (AMP)**
+   - Training uses full float32 precision
+   - Impact: 1.5-2x slower training, higher memory usage
+   - Fix: Add `torch.cuda.amp.autocast()` and `GradScaler`
 
-### Implementation Tasks:
-- [x] Stop old caching processes
-- [x] Remove old parquet files
-- [x] Modify `cache_codes_multigpu.py` to store FULL codes (no slicing)
-- [x] Implement smart weight initialization (fastai approach)
-- [x] Start multi-GPU caching with full codes
-- [x] Implement random slicing dataset class in `CachedCodesDataset`
-- [x] Add critical multi-scale alignment for random start positions
-- [x] Align audio slicing with codes (same random position)
-- [x] Fix shape mismatch bug (padding shorter tensors)
-- [x] Add `--limit` option for testing
-- [x] Add validation function
-- [x] Add checkpoint every 5000 iterations
-- [x] Add time-based checkpointing (every 30 min)
-- [x] Cache validation dataset (55,419 files)
-- [ ] Complete 50k row test run
-- [ ] Full-scale training (all 2.8M rows + validation)
+4. **Checkpoint missing metadata**
+   - Checkpoints don't save `limit`, `val_limit`, `segment_schedule`
+   - Impact: Resumed training won't respect these if used
+   - Fix: Add these fields to checkpoint dictionary
+
+5. **No signal handling for crashes**
+   - If process is killed (SIGTERM), no emergency checkpoint saved
+   - Impact: Could lose progress since last checkpoint
+   - Fix: Add signal handler for SIGTERM/SIGINT
+
+**Current training status**: None of these issues are critical enough to interrupt the running full-scale training. Can be addressed in future runs.
 
 ## Architecture
 ```
