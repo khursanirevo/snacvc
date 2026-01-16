@@ -162,4 +162,4 @@ checkpoints/
 data/
 pretrained_models
 outputs/
-comparison_samples/
+comparison_samples/.hf_cache/
